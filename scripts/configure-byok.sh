@@ -92,6 +92,24 @@ if [ "$BYOK_PROVIDER" = "anthropic" ]; then
         export NVM_DIR="$HOME/.nvm"
         [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 
+        # Verificar versao do Node — better-sqlite3 v11 trava em Node 22+
+        NODE_MAJOR=$(node --version 2>/dev/null | sed 's/v\([0-9]*\).*/\1/')
+        if [ -n "$NODE_MAJOR" ] && [ "$NODE_MAJOR" -ge 22 ]; then
+            echo ""
+            echo "  AVISO: Node.js v$(node --version) detectado."
+            echo "  better-sqlite3 v11 e incompativel com Node 22+."
+            echo "  Recomendado: nvm install 20 && nvm use 20 && nvm alias default 20"
+            echo ""
+            echo "  Continuando assim mesmo — o build pode falhar."
+            echo ""
+        fi
+
+        # Garantir pnpm disponivel
+        if ! command -v pnpm &>/dev/null; then
+            echo "  pnpm nao encontrado — instalando via npm..."
+            npm install -g pnpm
+        fi
+
         # Usar Python para modificar types.ts de forma segura
         python3 - << 'PYEOF'
 import re, sys, os
@@ -101,6 +119,7 @@ with open(filepath) as f:
     content = f.read()
 
 # --- 1. Adicionar modelos Claude ao STATIC_MODEL_BASELINE ---
+# Haiku com tierMinimum "dead" para funcionar mesmo sem creditos Conway
 claude_entries = """  {
     modelId: "claude-sonnet-5",
     provider: "anthropic",
@@ -119,7 +138,7 @@ claude_entries = """  {
     modelId: "claude-haiku-4-5-20251001",
     provider: "anthropic",
     displayName: "Claude Haiku 4.5",
-    tierMinimum: "low_compute",
+    tierMinimum: "dead",
     costPer1kInput: 8,
     costPer1kOutput: 40,
     maxTokens: 8192,
@@ -132,7 +151,6 @@ claude_entries = """  {
 """
 
 # Insere antes do ];  que fecha STATIC_MODEL_BASELINE
-# (é o primeiro ]; após a declaração do array)
 marker = "export const STATIC_MODEL_BASELINE"
 idx = content.find(marker)
 if idx == -1:
@@ -175,7 +193,25 @@ replacements = [
 for old, new in replacements:
     content = content.replace(old, new)
 
-# --- 3. Atualizar DEFAULT_MODEL_STRATEGY_CONFIG para Claude ---
+# --- 3. Patch tier "dead": adicionar haiku como candidato ---
+# Sem isso, o agente fica em dead-tier sem tokens por vez (0 tokens/turn)
+# quando o saldo Conway e <= 0 (ou quando a API retorna 401).
+import re as _re
+
+def patch_dead_tier(c):
+    # Localizar bloco "dead:" e substituir agent_turn candidates
+    dead_match = _re.search(r'dead:\s*\{[^}]*agent_turn:\s*\{[^}]*candidates:\s*\[\]', c)
+    if dead_match:
+        c = c.replace(
+            'candidates: [], maxTokens: 0, ceilingCents: 0',
+            'candidates: ["claude-haiku-4-5-20251001"], maxTokens: 2048, ceilingCents: -1',
+            1  # apenas primeira ocorrencia (dentro do bloco dead)
+        )
+    return c
+
+content = patch_dead_tier(content)
+
+# --- 4. Atualizar DEFAULT_MODEL_STRATEGY_CONFIG para Claude ---
 content = content.replace(
     'inferenceModel: "gpt-5.2",',
     'inferenceModel: "claude-sonnet-5",',
@@ -192,12 +228,13 @@ if "claude-sonnet-5" not in content:
 with open(filepath, "w") as f:
     f.write(content)
 
-print("  Patch aplicado: modelos Claude adicionados ao runtime.")
+print("  Patch aplicado: modelos Claude adicionados ao runtime (incluindo tier dead).")
 PYEOF
 
         echo "  Reconstruindo runtime Automaton com suporte Anthropic..."
         cd "$AUTOMATON_RUNTIME"
         pnpm build
+        pnpm rebuild better-sqlite3
         echo "  Build concluido."
     fi
 else
@@ -353,6 +390,13 @@ PYEOF
 mkdir -p "$AUTOMATON_DIR/skills/conway-compute"
 mkdir -p "$AUTOMATON_DIR/skills/conway-payments"
 mkdir -p "$AUTOMATON_DIR/skills/survival"
+
+# Remover DB de estado para limpar saldo Conway cacheado (-$0.01).
+# Sem isso, o agent inicia em tier "dead" indefinidamente.
+if [ -f "$AUTOMATON_DIR/state.db" ]; then
+    rm -f "$AUTOMATON_DIR/state.db"
+    echo "  state.db removido (saldo Conway cacheado apagado)."
+fi
 
 echo ""
 echo "=============================================================="
