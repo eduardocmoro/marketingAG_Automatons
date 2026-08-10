@@ -1,0 +1,17 @@
+# Runtime data — never commit wallet keys or live state
+.automaton/wallet.json
+.automaton/blacklist.db
+.automaton/compliance.log
+.automaton/learning_database.json
+.automaton/social_whitelist.json
+.automaton/daily_audit_report.txt
+.automaton/cron.log
+.automaton/state.db
+.automaton/intelligence/
+
+# Node
+node_modules/
+dist/
+
+# OS
+.DS_Store
