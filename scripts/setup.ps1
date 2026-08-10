@@ -112,7 +112,7 @@ fi
 echo "  Node: $(node --version) | pnpm: $(pnpm --version)"
 '@
 
-    $scriptNode | wsl bash
+    ($scriptNode -replace "`r`n", "`n") | wsl bash
     Write-Host "  Node.js e pnpm prontos." -ForegroundColor Green
 
     # ==============================================================================
@@ -136,7 +136,7 @@ fi
 cd ~/marketingAG_Automatons && bash scripts/setup.sh
 "@
 
-    $scriptSetup | wsl bash
+    ($scriptSetup -replace "`r`n", "`n") | wsl bash
     Write-Host "  Ambiente configurado com sucesso no WSL." -ForegroundColor Green
 
 }
