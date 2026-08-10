@@ -72,6 +72,19 @@ cp "$REPO_DIR/config/AGENTLAUNCH_CONSTITUTION.md" "$HOME/.automaton/AGENTLAUNCH_
 cp "$REPO_DIR/config/genesis_prompt.txt"           "$HOME/.automaton/genesis_prompt.txt"
 
 # ──────────────────────────────────────────────────────────────────
+# BYOK auto-config: se ANTHROPIC_API_KEY ou OPENAI_API_KEY estiverem
+# definidas, configura o agente automaticamente (sem wizard interativo).
+# ──────────────────────────────────────────────────────────────────
+if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+    echo ""
+    echo "  [BYOK] Chave de API detectada — configurando sem Conway Cloud..."
+    bash "$REPO_DIR/scripts/configure-byok.sh"
+    BYOK_CONFIGURED=true
+else
+    BYOK_CONFIGURED=false
+fi
+
+# ──────────────────────────────────────────────────────────────────
 # 4. Instalar o supervisor em caminho fixo (~/.automaton/claude_supervisor.sh)
 #    O Agendador de Tarefas do Windows (via wsl.exe) e o cron Linux
 #    usam sempre este caminho fixo.
@@ -101,11 +114,27 @@ echo ""
 echo "=============================================================="
 echo " SISTEMA AGENTLAUNCH HQ CONFIGURADO COM SUCESSO!"
 echo ""
-echo " Para iniciar o runtime do agente:"
-echo "   cd $HOME/automaton && node dist/index.js --run"
-echo ""
-echo " Para aportar os \$5,00 USD iniciais (outro terminal):"
-echo "   cd $HOME/automaton && node packages/cli/dist/index.js fund 5.00"
+
+if [ "${BYOK_CONFIGURED:-false}" = "true" ]; then
+    echo " Configuracao BYOK aplicada (sem Conway Cloud)."
+    echo ""
+    echo " Para iniciar o agente:"
+    echo "   cd $HOME/automaton && node dist/index.js --run"
+else
+    echo " PROXIMO PASSO — configurar chave de API:"
+    echo ""
+    echo "   Opcao A (Anthropic, recomendado):"
+    echo "     export ANTHROPIC_API_KEY='sk-ant-...'"
+    echo "     bash $REPO_DIR/scripts/configure-byok.sh"
+    echo ""
+    echo "   Opcao B (OpenAI):"
+    echo "     export OPENAI_API_KEY='sk-...'"
+    echo "     bash $REPO_DIR/scripts/configure-byok.sh"
+    echo ""
+    echo "   Opcao C (wizard interativo, requer conta Conway ativa):"
+    echo "     cd $HOME/automaton && node dist/index.js --run"
+fi
+
 echo ""
 echo " Supervisor instalado em: ~/.automaton/claude_supervisor.sh"
 echo " Log de auditoria:        ~/.automaton/cron.log"

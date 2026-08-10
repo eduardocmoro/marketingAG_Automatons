@@ -11,6 +11,14 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 [ -s "$HOME/.profile"  ] && . "$HOME/.profile" 2>/dev/null || true
 
+# Carregar chaves BYOK (Anthropic/OpenAI) salvas pelo configure-byok.sh
+if [ -f "$HOME/.automaton/.env" ]; then
+    # shellcheck disable=SC1090
+    set -a
+    . "$HOME/.automaton/.env" 2>/dev/null || true
+    set +a
+fi
+
 LOG_FILE="$HOME/.automaton/compliance.log"
 REPORT_FILE="$HOME/.automaton/daily_audit_report.txt"
 
