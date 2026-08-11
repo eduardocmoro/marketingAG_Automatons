@@ -231,6 +231,63 @@ with open(filepath, "w") as f:
 print("  Patch aplicado: modelos Claude adicionados ao runtime (incluindo tier dead).")
 PYEOF
 
+        # Patch router.ts: corrigir fixAnthropicMessages que quebra tool_result blocks
+        ROUTER_FILE="$AUTOMATON_RUNTIME/src/inference/router.ts"
+        if grep -q "_toolResultMerged" "$ROUTER_FILE" 2>/dev/null; then
+            python3 - << 'ROUTERPYEOF'
+import re, os, sys
+
+filepath = os.path.expanduser("~/automaton/src/inference/router.ts")
+with open(filepath) as f:
+    content = f.read()
+
+old = '''    if (msg.role === "tool") {
+      const last = result[result.length - 1];
+      // If previous message was also a tool (now a user), merge into it
+      if (last && last.role === "user" && (last as any)._toolResultMerged) {
+        // Append to the merged content
+        last.content = last.content + "\\n[tool_result:" + (msg.tool_call_id || "unknown") + "] " + msg.content;
+        continue;
+      }
+      // Otherwise create a new user message
+      const userMsg: ChatMessage & { _toolResultMerged?: boolean } = {
+        role: "user",
+        content: "[tool_result:" + (msg.tool_call_id || "unknown") + "] " + msg.content,
+        _toolResultMerged: true,
+      };
+      result.push(userMsg);
+      continue;
+    }'''
+
+new = '''    if (msg.role === "tool") {
+      // Passar sem alterar: transformMessagesForAnthropic em conway/inference.ts
+      // ja converte role:"tool" para tool_result blocks no formato correto da Anthropic.
+      result.push({ ...msg });
+      continue;
+    }'''
+
+if old in content:
+    content = content.replace(old, new, 1)
+    print("  Patch router.ts aplicado: fixAnthropicMessages corrigido.")
+else:
+    # Fallback regex para variacoes de whitespace
+    patched = re.sub(
+        r'if \(msg\.role === "tool"\) \{[^}]*(?:\{[^}]*\}[^}]*)*\}',
+        new, content, count=1, flags=re.DOTALL
+    )
+    if patched != content:
+        content = patched
+        print("  Patch router.ts aplicado via regex.")
+    else:
+        print("  router.ts: patch ja aplicado ou nao necessario.")
+
+with open(filepath, "w") as f:
+    f.write(content)
+ROUTERPYEOF
+        else
+            echo "  router.ts: patch fixAnthropicMessages ja aplicado."
+        fi
+
         echo "  Reconstruindo runtime Automaton com suporte Anthropic..."
         cd "$AUTOMATON_RUNTIME"
         pnpm build
