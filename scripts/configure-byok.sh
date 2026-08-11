@@ -511,6 +511,30 @@ PYEOF
 mkdir -p "$AUTOMATON_DIR/skills/conway-compute"
 mkdir -p "$AUTOMATON_DIR/skills/conway-payments"
 mkdir -p "$AUTOMATON_DIR/skills/survival"
+mkdir -p "$AUTOMATON_DIR/skills/contact"
+
+# Instalar skill de contato multi-canal
+SKILL_SRC="$(dirname "$0")/../skills/contact-agent.md"
+if [ -f "$SKILL_SRC" ]; then
+    cp "$SKILL_SRC" "$AUTOMATON_DIR/skills/contact/SKILL.md"
+    echo "  Skill contact instalada em ~/.automaton/skills/contact/"
+fi
+
+# Configurar SendGrid se disponivel
+if [ -n "$SENDGRID_API_KEY" ]; then
+    python3 - << 'SGPYEOF'
+import json, os
+config_path = os.path.expanduser("~/.automaton/automaton.json")
+with open(config_path) as f:
+    config = json.load(f)
+config["sendgridApiKey"] = os.environ["SENDGRID_API_KEY"]
+if os.environ.get("SENDGRID_FROM"):
+    config["sendgridFrom"] = os.environ["SENDGRID_FROM"]
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+print(f"  SendGrid configurado (key: {os.environ['SENDGRID_API_KEY'][:10]}...)")
+SGPYEOF
+fi
 
 # Remover DB de estado para limpar saldo Conway cacheado (-$0.01).
 # Sem isso, o agent inicia em tier "dead" indefinidamente.
