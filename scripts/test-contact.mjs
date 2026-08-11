@@ -173,11 +173,11 @@ async function method1_webhook(card) {
 async function method2_email(card) {
   console.log("\n[3/4] MÉTODO 2 — Email");
 
-  // Extrair email do card
+  // Extrair email do card (suporta name:"email" e type:"email")
   const email =
     card.contact?.email ||
     card.email ||
-    card.services?.find((s) => s.type === "email")?.endpoint;
+    card.services?.find((s) => s.type === "email" || s.name === "email")?.endpoint;
 
   if (!email) {
     console.log("      ❌ Nenhum email no agent card");
@@ -235,7 +235,13 @@ async function method2_email(card) {
 async function method3_conway(card) {
   console.log("\n[4/4] MÉTODO 3 — Conway Relay");
 
-  const targetAddress = card.walletAddress || card.address;
+  // Wallet pode estar em agentWallet service (formato: eip155:8453:0x...)
+  const walletService = card.services?.find((s) => s.name === "agentWallet");
+  let targetAddress = card.walletAddress || card.address;
+  if (!targetAddress && walletService?.endpoint) {
+    const parts = walletService.endpoint.split(":");
+    targetAddress = parts[parts.length - 1];
+  }
   if (!targetAddress) {
     console.log("      ❌ Endereço do agente não encontrado no card");
     return { success: false, reason: "no_wallet_in_card" };
