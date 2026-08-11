@@ -288,6 +288,70 @@ ROUTERPYEOF
             echo "  router.ts: patch fixAnthropicMessages ja aplicado."
         fi
 
+        # Patch provision.ts: cookie forwarding para corrigir "Invalid or expired nonce"
+        # ResilientHttpClient nao tem cookie jar; o servidor SIWE armazena o nonce
+        # numa sessao vinculada ao Set-Cookie do request /nonce. Sem reenviar o cookie,
+        # o endpoint /verify nao encontra o nonce e retorna 401.
+        PROVISION_FILE="$AUTOMATON_RUNTIME/src/identity/provision.ts"
+        if [ -f "$PROVISION_FILE" ] && ! grep -q "getSetCookie" "$PROVISION_FILE" 2>/dev/null; then
+            python3 - << 'PROVPYEOF'
+import os, sys
+
+filepath = os.path.expanduser("~/automaton/src/identity/provision.ts")
+with open(filepath) as f:
+    content = f.read()
+
+old_nonce = '  const { nonce } = (await nonceResp.json()) as { nonce: string };'
+
+new_nonce = ('  const { nonce } = (await nonceResp.json()) as { nonce: string };\n'
+'\n'
+'  // Preservar cookie de sessao para que o servidor associe o nonce ao verify.\n'
+'  // ResilientHttpClient nao tem cookie jar, entao fazemos o forward manualmente.\n'
+'  const setCookieHeaders: string[] =\n'
+'    typeof (nonceResp.headers as any).getSetCookie === "function"\n'
+'      ? (nonceResp.headers as any).getSetCookie()\n'
+'      : nonceResp.headers.get("set-cookie")\n'
+'      ? [nonceResp.headers.get("set-cookie")!]\n'
+'      : [];\n'
+'  const sessionCookie = setCookieHeaders\n'
+'    .map((h) => h.split(";")[0].trim())\n'
+'    .join("; ");')
+
+old_verify = ('  const verifyResp = await httpClient.request(`${url}/v1/auth/verify`, {\n'
+'    method: "POST",\n'
+'    headers: { "Content-Type": "application/json" },\n'
+'    body: JSON.stringify(verifyBody),\n'
+'  });')
+
+new_verify = ('  const verifyResp = await httpClient.request(`${url}/v1/auth/verify`, {\n'
+'    method: "POST",\n'
+'    headers: {\n'
+'      "Content-Type": "application/json",\n'
+'      ...(sessionCookie ? { Cookie: sessionCookie } : {}),\n'
+'    },\n'
+'    body: JSON.stringify(verifyBody),\n'
+'  });')
+
+if old_nonce not in content:
+    print("  provision.ts: marca do nonce nao encontrada — patch ja aplicado ou formato diferente.")
+    sys.exit(0)
+
+content = content.replace(old_nonce, new_nonce, 1)
+content = content.replace(old_verify, new_verify, 1)
+
+if "getSetCookie" not in content:
+    print("ERRO: patch provision.ts nao aplicado corretamente.", file=sys.stderr)
+    sys.exit(1)
+
+with open(filepath, "w") as f:
+    f.write(content)
+
+print("  Patch provision.ts aplicado: cookie forwarding para SIWE verify.")
+PROVPYEOF
+        else
+            echo "  provision.ts: patch cookie forwarding ja aplicado ou arquivo nao encontrado."
+        fi
+
         echo "  Reconstruindo runtime Automaton com suporte Anthropic..."
         cd "$AUTOMATON_RUNTIME"
         pnpm build
