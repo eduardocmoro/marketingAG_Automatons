@@ -50,15 +50,26 @@ Vencedor de regime único é **candidato, não campeão**.
 
 ## Separação slippage (emenda 3)
 
-| Campo | Fase | Origem |
-|---|---|---|
-| `quotedPriceImpactPct` | 1 e 2 | `priceImpactPct` da quote do roteador |
-| `realizedSlippagePct` | **2 apenas** | diferença entre cotado e obtido on-chain |
+Quatro conceitos distintos que **nunca se misturam**:
 
-Os dois **nunca se misturam**. `realizedSlippagePct` permanece `null` durante todo
-o paper trading. O kill switch da Fase 2 compara um contra o outro —
-`slippageDivergence()` em `src/costs/model.ts` lança erro se alguém tentar usar o
-cotado como substituto do realizado.
+| Campo | Função de | Fase | Origem |
+|---|---|---|---|
+| `quotedPriceImpactPct` | **tamanho** | 1 e 2 | `priceImpactPct` da quote |
+| `quotedDriftBpsByLatency` | **tempo** | 1 e 2 | recotação após cada horizonte |
+| `realizedSlippagePct` | execução | **2 apenas** | cotado vs. obtido on-chain |
+| `txFailureRate` | execução | **2 apenas** | fração de tx que falharam |
+
+Os dois últimos permanecem `null` durante todo o paper trading, e o relatório
+verifica isso a cada execução. `slippageDivergence()` e
+`effectiveCostWithFailures()` em `src/costs/model.ts` lançam erro se alguém tentar
+usá-los na Fase 1 — sem execução real esses números não existem, e estimá-los
+seria inventar.
+
+Motivo do `txFailureRate` existir já: pelo [ADR-001 §2](docs/ADR-001-carteira-unica.md),
+falha mal contabilizada é a contaminação mais perigosa do modelo. Uma execução que
+falha por saldo reservado não devolvido **parece slippage adverso**, envenena a
+métrica que o kill switch observa, e faz o enxame matar agentes bons. Na Fase 2 a
+falha entra no break-even como custo, não como ruído.
 
 ## Fronteira de linguagem (emenda 4)
 
@@ -82,6 +93,7 @@ Zero código de estratégia. O que é medido:
 | Priority fee | `getRecentPrioritizationFees`, distribuição (mediana e p90), não ponto único |
 | Fee de pool | `routePlan` real da quote — venue, `feeAmount`, `feeMint`, nº de hops por salto. Nada fixado em 0,25% |
 | Price impact cotado | `priceImpactPct` da quote, **nas duas direções** (assimétrico em CLMM) |
+| Drift por latência | mesma quote recotada após 250ms / 500ms / 1s / 2s / 5s |
 | Rent de ATA | `getMinimumBalanceForRentExemption(165)` — custo de **setup, uma vez**, não por trade |
 
 Tamanhos: **0,50 / 1 / 2 / 5** USDC (núcleo da tese) + 10 / 50 / 100 / 500 (escala).
@@ -99,6 +111,30 @@ uma por mint negociado, não uma por posição nem uma por agente.
 
 Por isso o rent ficou fora de `RoundTripCost` e do cálculo de break-even. O
 relatório converte pelo preço de SOL **medido na amostra**, nunca por constante.
+
+### Drift de cotação: o custo do tempo
+
+Custo estático (fee, impacto) é função do tamanho. Custo do tempo não é, e slot
+time da Solana é ~350ms — a quote envelhece dentro do loop.
+
+A medição cota em t0 e recota o **mesmo par e tamanho** após cada horizonte,
+registrando o delta de `outAmount` em bps. Isso produz um **piso empírico de
+slippage sem executar nada**.
+
+A mediana com sinal tende a zero (o preço anda para os dois lados); o que custa é
+a **magnitude**, porque metade das vezes ela joga contra. O break-even sensível a
+latência usa essa magnitude:
+
+```
+break_even = swapLoss + networkCost + |drift(latência)|
+```
+
+O relatório imprime a coluna sem drift e com drift em 1s e 2s, para mostrar quanto
+a velocidade do loop custa ao desenho.
+
+O horizonte real de cada ponto fica entre `elapsedMsAtRequest` e
+`elapsedMsAtResponse` — os dois são registrados em vez de assumir que a espera
+nominal foi exata.
 
 Round trip é medido de ponta a ponta: entra com N USDC, a perna 2 usa exatamente
 o `outAmount` da perna 1, sai com M USDC. `swapLoss = N − M` captura fee de pool e
@@ -119,8 +155,22 @@ bash scripts/run-day1.sh 8 300      # 1 bloco: 8 amostras a cada 5 min
 **Um bloco não fecha o Day 1.** Oito amostras seguidas cobrem ~40 minutos: um
 único regime de congestionamento. O mínimo é **3 blocos em horários distintos ao
 longo de 2 dias**, acumulando no mesmo `measurements/day1_costs.jsonl`
-(append-only). O relatório detecta a cobertura, avisa enquanto ela for
-insuficiente, e mediana/p90 só descrevem o regime geral depois disso.
+(append-only).
+
+O relatório aplica **dois gates**, e ambos precisam passar:
+
+1. **Cobertura temporal** — ≥ 3 janelas em ≥ 24h.
+2. **Variação de congestionamento** — a janela mais congestionada precisa ter ao
+   menos 2× o priority fee mediano da mais calma.
+
+O segundo existe porque três janelas em horário morto passam no primeiro e
+**mentem no p90**. O próprio priority fee é o medidor de atividade on-chain, então
+o gate é medido, não presumido. Pelo menos um bloco precisa cair em período de
+alta atividade — na prática, o horário de mercado dos EUA (~13:00–21:00 UTC)
+costuma ser mais movimentado que a madrugada.
+
+Cada bloco leva ~40s a mais por causa da medição de drift (5s de horizonte por
+tamanho de trade).
 
 Relatório isolado:
 

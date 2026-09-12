@@ -37,6 +37,11 @@ MIN_WINDOWS = 3
 MIN_SPAN_HOURS = 24
 WINDOW_GAP_HOURS = 1  # intervalo que separa duas janelas distintas
 
+# Item 4: pelo menos uma janela precisa cair em atividade alta. O priority
+# fee mediano da janela é o medidor. Exigir que a janela mais congestionada
+# seja ao menos este múltiplo da mais calma.
+MIN_CONGESTION_SPREAD = 2.0
+
 
 # ── Ingestão: JSONL -> SQLite ────────────────────────────────────────
 
@@ -74,14 +79,35 @@ CREATE TABLE IF NOT EXISTS round_trip (
     net_lamports_median     INTEGER,
     net_lamports_p90        INTEGER,
     cu_consumed_source      TEXT,
+    tx_failure_rate         REAL,   -- FASE 2 apenas; null no paper
     error                   TEXT
 );
+
+CREATE TABLE IF NOT EXISTS quote_drift (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id               INTEGER NOT NULL REFERENCES run(run_id),
+    position_size_usdc   REAL NOT NULL,
+    nominal_horizon_ms   INTEGER NOT NULL,
+    elapsed_ms_request   INTEGER,
+    elapsed_ms_response  INTEGER,
+    drift_bps            REAL,
+    error                TEXT
+);
 """
+
+# Horizontes usados nas colunas de break-even sensível à latência.
+BREAK_EVEN_HORIZONS_MS = [1000, 2000]
 
 
 def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    # Bases criadas antes destas colunas continuam utilizáveis.
+    for table, col, decl in [("round_trip", "tx_failure_rate", "REAL")]:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass  # coluna já existe
 
     if not jsonl_path.exists():
         print(f"ERRO: {jsonl_path} não existe. Rode scripts/measure-day1.mjs primeiro.")
@@ -151,8 +177,8 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                         leg1_realized_slip_pct, leg2_realized_slip_pct,
                         leg1_hops, leg2_hops, leg1_venues, leg2_venues,
                         net_lamports_median, net_lamports_p90,
-                        cu_consumed_source, error)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        cu_consumed_source, tx_failure_rate, error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         run_id,
                         rt.get("positionSizeUsdc"),
@@ -171,9 +197,37 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                         (l1m + l2m) if (l1m is not None and l2m is not None) else None,
                         (l1p + l2p) if (l1p is not None and l2p is not None) else None,
                         (leg1.get("compute") or {}).get("cuConsumedSource"),
+                        rt.get("txFailureRate"),  # null na Fase 1, por construção
                         rt.get("error"),
                     ),
                 )
+
+            for drift in rec.get("quoteDrift", []):
+                size = drift.get("positionSizeUsdc")
+                if drift.get("error"):
+                    conn.execute(
+                        """INSERT INTO quote_drift
+                           (run_id, position_size_usdc, nominal_horizon_ms, error)
+                           VALUES (?,?,?,?)""",
+                        (run_id, size, -1, drift["error"]),
+                    )
+                    continue
+                for pt in drift.get("points", []):
+                    conn.execute(
+                        """INSERT INTO quote_drift
+                           (run_id, position_size_usdc, nominal_horizon_ms,
+                            elapsed_ms_request, elapsed_ms_response, drift_bps, error)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        (
+                            run_id,
+                            size,
+                            pt.get("nominalHorizonMs"),
+                            pt.get("elapsedMsAtRequest"),
+                            pt.get("elapsedMsAtResponse"),
+                            pt.get("driftBps"),
+                            pt.get("error"),
+                        ),
+                    )
 
     conn.commit()
     print(f"Ingestão: {inserted_runs} nova(s) execução(ões) -> {db_path}")
@@ -199,6 +253,39 @@ def fmt(v, nd=4, dash="—"):
     return dash if v is None else f"{v:.{nd}f}"
 
 
+def drift_stats(conn, size=None):
+    """
+    |drift| por horizonte de latência.
+
+    A mediana COM SINAL tende a zero (o preço anda para os dois lados).
+    O custo está na MAGNITUDE: metade das vezes o movimento é adverso, e é
+    esse caso que define o break-even conservador.
+    """
+    q = (
+        "SELECT nominal_horizon_ms, drift_bps FROM quote_drift "
+        "WHERE drift_bps IS NOT NULL AND nominal_horizon_ms > 0"
+    )
+    params = []
+    if size is not None:
+        q += " AND position_size_usdc = ?"
+        params.append(size)
+
+    by_horizon = {}
+    for h, d in conn.execute(q, params):
+        by_horizon.setdefault(h, []).append(d)
+
+    out = {}
+    for h, vals in by_horizon.items():
+        absv = [abs(v) for v in vals]
+        out[h] = {
+            "n": len(vals),
+            "median_signed": statistics.median(vals),
+            "median_abs": statistics.median(absv),
+            "p90_abs": pct(absv, 0.9),
+        }
+    return out
+
+
 def parse_ts(s):
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -214,27 +301,56 @@ def coverage(conn):
     distribuição. Sem janelas espalhadas, mediana e p90 descrevem aquela hora
     e nada além dela.
     """
-    stamps = [
-        parse_ts(r[0])
-        for r in conn.execute("SELECT timestamp_utc FROM run ORDER BY timestamp_utc")
+    rows = [
+        (parse_ts(r[0]), r[1])
+        for r in conn.execute(
+            "SELECT timestamp_utc, cu_price_median FROM run ORDER BY timestamp_utc"
+        )
     ]
-    stamps = [s for s in stamps if s is not None]
-    if not stamps:
-        return {"windows": [], "span_hours": 0.0, "hours_of_day": set(), "sufficient": False}
+    rows = [(t, c) for t, c in rows if t is not None]
+    if not rows:
+        return {
+            "windows": [],
+            "span_hours": 0.0,
+            "hours_of_day": set(),
+            "sufficient": False,
+            "congestion_spread": None,
+            "congestion_varied": False,
+        }
 
-    windows = [[stamps[0]]]
-    for ts in stamps[1:]:
-        if (ts - windows[-1][-1]) > timedelta(hours=WINDOW_GAP_HOURS):
-            windows.append([ts])
+    windows = [[rows[0]]]
+    for row in rows[1:]:
+        if (row[0] - windows[-1][-1][0]) > timedelta(hours=WINDOW_GAP_HOURS):
+            windows.append([row])
         else:
-            windows[-1].append(ts)
+            windows[-1].append(row)
 
+    stamps = [t for t, _ in rows]
     span_hours = (stamps[-1] - stamps[0]).total_seconds() / 3600
+
+    # Item 4: três janelas em horário morto passam o gate de tempo e mentem
+    # no p90. O próprio priority fee é o medidor de atividade on-chain —
+    # exigir que as janelas cubram regimes de congestionamento diferentes.
+    win_congestion = []
+    for w in windows:
+        vals = [c for _, c in w if c is not None]
+        win_congestion.append(statistics.median(vals) if vals else None)
+
+    valid = [c for c in win_congestion if c is not None and c > 0]
+    spread = (max(valid) / min(valid)) if len(valid) >= 2 else None
+    congestion_varied = spread is not None and spread >= MIN_CONGESTION_SPREAD
+
     return {
         "windows": windows,
+        "window_congestion": win_congestion,
         "span_hours": span_hours,
         "hours_of_day": {s.hour for s in stamps},
-        "sufficient": len(windows) >= MIN_WINDOWS and span_hours >= MIN_SPAN_HOURS,
+        "sufficient": (
+            len(windows) >= MIN_WINDOWS and span_hours >= MIN_SPAN_HOURS and congestion_varied
+        ),
+        "enough_windows": len(windows) >= MIN_WINDOWS and span_hours >= MIN_SPAN_HOURS,
+        "congestion_spread": spread,
+        "congestion_varied": congestion_varied,
     }
 
 
@@ -295,14 +411,27 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
         f"  Cobertura      : {n_win} janela(s), {cov['span_hours']:.1f}h de span, "
         f"horas UTC {sorted(cov['hours_of_day'])}"
     )
+    spread = cov["congestion_spread"]
+    wc = [f"{c:.0f}" if c is not None else "?" for c in (cov.get("window_congestion") or [])]
+    print(
+        f"  Congestionam.  : por janela {wc}"
+        + (f" | spread {spread:.1f}x" if spread is not None else " | spread n/d")
+    )
+
     if not cov["sufficient"]:
         print()
         print("  " + "!" * 72)
-        print(f"  ATENCAO: cobertura insuficiente ({n_win} janela(s), {cov['span_hours']:.1f}h).")
-        print(f"  Minimo para estimar congestionamento: {MIN_WINDOWS} janelas em "
-              f">= {MIN_SPAN_HOURS}h.")
+        if not cov["enough_windows"]:
+            print(f"  ATENCAO: cobertura temporal insuficiente ({n_win} janela(s), "
+                  f"{cov['span_hours']:.1f}h).")
+            print(f"  Minimo: {MIN_WINDOWS} janelas em >= {MIN_SPAN_HOURS}h.")
+        if not cov["congestion_varied"]:
+            print(f"  ATENCAO: janelas em regime de congestionamento parecido"
+                  + (f" (spread {spread:.1f}x, minimo {MIN_CONGESTION_SPREAD:.1f}x)."
+                     if spread is not None else " (spread indisponivel)."))
+            print("  Tres janelas em horario morto passam no gate de tempo e MENTEM no p90.")
+            print("  Rode um bloco em periodo de alta atividade on-chain.")
         print("  Mediana e p90 abaixo descrevem as janelas medidas, nao o regime geral.")
-        print("  Rode mais blocos em horarios distintos antes de decidir qualquer coisa.")
         print("  " + "!" * 72)
 
     # ── Tabela principal ──
@@ -394,6 +523,57 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
             f"{fmt(s['total_sunk_p90_pct'], 3) + '%':>14} | {fmt(s['break_even_move_p90_pct'], 3) + '%':>15}"
         )
 
+    # ── Drift por latência: o custo do TEMPO ──
+    dstats = drift_stats(conn)
+    print()
+    print("-" * 78)
+    print("  DRIFT DE COTACAO POR LATENCIA — O CUSTO DO TEMPO")
+    print("  (mesma quote, mesmo par e tamanho, recotada apos cada horizonte)")
+    print("-" * 78)
+    if not dstats:
+        print("  Sem amostras de drift nesta base.")
+    else:
+        print()
+        print(f"  {'HORIZONTE':>10} | {'n':>5} | {'MEDIANA':>10} | {'|DRIFT| MED':>12} | {'|DRIFT| p90':>12}")
+        print(f"  {'':>10} | {'':>5} | {'com sinal':>10} | {'bps':>12} | {'bps':>12}")
+        print("  " + "-" * 62)
+        for h in sorted(dstats):
+            d = dstats[h]
+            print(
+                f"  {str(h) + 'ms':>10} | {d['n']:>5} | "
+                f"{fmt(d['median_signed'], 2):>10} | {fmt(d['median_abs'], 2):>12} | "
+                f"{fmt(d['p90_abs'], 2):>12}"
+            )
+        print()
+        print("  A mediana com sinal tende a zero — o preco anda para os dois lados.")
+        print("  O que custa e a MAGNITUDE: metade das vezes ela joga contra.")
+
+        # ── Break-even sensivel a velocidade do loop ──
+        print()
+        print("-" * 78)
+        print("  BREAK-EVEN SENSIVEL A VELOCIDADE DO LOOP")
+        print("  break_even = swapLoss + rede + |drift(latencia)|   (caso adverso)")
+        print("-" * 78)
+        print()
+        cols = " | ".join(f"{'+' + str(h) + 'ms':>11}" for h in BREAK_EVEN_HORIZONS_MS)
+        print(f"  {'POSIÇÃO':>9} | {'SEM DRIFT':>11} | {cols}")
+        print("  " + "-" * 62)
+        for s in summary:
+            cells = []
+            for h in BREAK_EVEN_HORIZONS_MS:
+                d = dstats.get(h)
+                base_be = s["break_even_move_median_pct"]
+                if d is None or base_be is None or d["median_abs"] is None:
+                    cells.append(f"{'—':>11}")
+                else:
+                    be = base_be + d["median_abs"] / 100
+                    s[f"break_even_with_drift_{h}ms_pct"] = be
+                    cells.append(f"{fmt(be, 3) + '%':>11}")
+            print(
+                f"  {'$' + format(s['position_usdc'], 'g'):>9} | "
+                f"{fmt(s['break_even_move_median_pct'], 3) + '%':>11} | " + " | ".join(cells)
+            )
+
     # ── Leitura direta ──
     one = next((s for s in summary if abs(s["position_usdc"] - 1.0) < 1e-9), None)
     print()
@@ -458,10 +638,20 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
     print("  " + "-" * 74)
     if leaked == 0:
         print("  [OK] realized_slippage vazio em todas as amostras — correto na Fase 1.")
-        print("       quoted_price_impact NÃO foi usado como substituto.")
+        print("       quoted_price_impact e quoted_drift NAO foram usados como substitutos.")
     else:
         print(f"  [ALERTA] {leaked} amostra(s) com realized_slippage preenchido na Fase 1.")
         print("           Isso não deveria acontecer fora da execução real.")
+
+    fail_leaked = conn.execute(
+        "SELECT COUNT(*) FROM round_trip WHERE tx_failure_rate IS NOT NULL"
+    ).fetchone()[0]
+    if fail_leaked == 0:
+        print("  [OK] tx_failure_rate vazio em todas as amostras — correto na Fase 1.")
+        print("       Sem execucao real nao ha falha para contar (ADR-001 §2).")
+    else:
+        print(f"  [ALERTA] {fail_leaked} amostra(s) com tx_failure_rate na Fase 1.")
+        print("           Taxa de falha estimada sem execucao e numero inventado.")
 
     # Ao lado do .sqlite usado, para que um fixture nunca escreva em measurements/.
     out = out_dir / "day1_summary.json"
@@ -474,7 +664,12 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
                     "windows": len(cov["windows"]),
                     "span_hours": cov["span_hours"],
                     "hours_of_day_utc": sorted(cov["hours_of_day"]),
+                    "congestion_spread": cov["congestion_spread"],
+                    "congestion_varied": cov["congestion_varied"],
                     "sufficient": cov["sufficient"],
+                },
+                "quoted_drift_bps_by_latency": {
+                    str(h): dstats[h] for h in sorted(dstats)
                 },
             },
             indent=2,

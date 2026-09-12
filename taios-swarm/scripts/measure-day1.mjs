@@ -40,6 +40,10 @@ const SPL_TOKEN_ACCOUNT_BYTES = 165; // tamanho de uma ATA SPL
 // Emenda 1: núcleo da tese (US$0,50–5) + escala comparativa (10–500)
 const TRADE_SIZES_USDC = [0.5, 1, 2, 5, 10, 50, 100, 500];
 
+// Horizontes de latência para medir envelhecimento de cotação.
+// Slot time da Solana é ~350ms — uma quote envelhece dentro do loop.
+const LATENCY_HORIZONS_MS = [250, 500, 1000, 2000, 5000];
+
 const RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 
 // Conta pública apenas para montar/simular a tx e obter unitsConsumed.
@@ -295,6 +299,79 @@ async function measureAtaRent() {
   }
 }
 
+// ── Drift de cotação por latência ────────────────────────────────────
+
+/**
+ * Custo do TEMPO, não do tamanho.
+ *
+ * Cota em t0, espera cada horizonte e recota o MESMO par e tamanho.
+ * O delta de outAmount é um piso empírico de slippage — quanto a cotação
+ * envelhece enquanto o loop decide — sem executar nada.
+ *
+ * Distinto de quotedPriceImpact (função do tamanho) e de realizedSlippage
+ * (só existe com execução real, Fase 2).
+ *
+ * Sinal: driftBps > 0 = receberia MAIS (a favor). < 0 = MENOS (contra).
+ * A distribuição é aproximadamente simétrica; o que custa é a magnitude.
+ */
+async function measureQuoteDrift(sizeUsdc) {
+  const inRaw = toRaw(sizeUsdc, USDC_DECIMALS);
+  const result = {
+    positionSizeUsdc: sizeUsdc,
+    baseOutAmount: null,
+    baseQuoteAtUtc: null,
+    points: [],
+    error: null,
+  };
+
+  let base;
+  let baseDoneAt;
+  try {
+    const t0 = Date.now();
+    const q0 = await jupQuote(USDC_MINT, SOL_MINT, inRaw);
+    baseDoneAt = Date.now();
+    base = Number(q0.outAmount);
+    result.baseOutAmount = q0.outAmount;
+    result.baseQuoteAtUtc = new Date(t0).toISOString();
+  } catch (e) {
+    result.error = e.message.slice(0, 200);
+    return result;
+  }
+
+  for (const horizon of LATENCY_HORIZONS_MS) {
+    const waitMs = baseDoneAt + horizon - Date.now();
+    if (waitMs > 0) await sleep(waitMs);
+
+    // O horizonte real fica entre o envio e a resposta — registra os dois
+    // em vez de assumir que a espera nominal foi exata.
+    const sentAt = Date.now();
+    try {
+      const q = await jupQuote(USDC_MINT, SOL_MINT, inRaw);
+      const recvAt = Date.now();
+      const out = Number(q.outAmount);
+      result.points.push({
+        nominalHorizonMs: horizon,
+        elapsedMsAtRequest: sentAt - baseDoneAt,
+        elapsedMsAtResponse: recvAt - baseDoneAt,
+        outAmount: q.outAmount,
+        driftBps: ((out - base) / base) * 10_000,
+        error: null,
+      });
+    } catch (e) {
+      result.points.push({
+        nominalHorizonMs: horizon,
+        elapsedMsAtRequest: sentAt - baseDoneAt,
+        elapsedMsAtResponse: null,
+        outAmount: null,
+        driftBps: null,
+        error: e.message.slice(0, 150),
+      });
+    }
+  }
+
+  return result;
+}
+
 // ── Emenda 4: round trip nas duas direções ───────────────────────────
 
 /**
@@ -430,7 +507,7 @@ async function main() {
     console.log(`      FALHOU: ${priceError}`);
   }
 
-  console.log("[4/4] Medindo round trip por tamanho...");
+  console.log("[4/5] Medindo round trip por tamanho...");
   const roundTrips = [];
   for (const size of TRADE_SIZES_USDC) {
     process.stdout.write(`      $${size} ... `);
@@ -448,6 +525,28 @@ async function main() {
     await sleep(400); // respeita rate limit do RPC/Jupiter público
   }
 
+  console.log("[5/5] Medindo drift de cotação por latência...");
+  console.log(`      horizontes: ${LATENCY_HORIZONS_MS.join("ms, ")}ms`);
+  const quoteDrift = [];
+  for (const size of TRADE_SIZES_USDC) {
+    process.stdout.write(`      $${size} ... `);
+    const d = await measureQuoteDrift(size);
+    quoteDrift.push(d);
+    if (d.error) {
+      console.log(`ERRO: ${d.error}`);
+    } else {
+      const summary = d.points
+        .map((p) =>
+          p.driftBps != null
+            ? `${p.nominalHorizonMs}ms:${p.driftBps >= 0 ? "+" : ""}${p.driftBps.toFixed(1)}bps`
+            : `${p.nominalHorizonMs}ms:erro`
+        )
+        .join("  ");
+      console.log(summary);
+    }
+    await sleep(400);
+  }
+
   // Emenda 6: append com timestamp UTC e preço de cada amostra.
   const record = {
     schemaVersion: 1,
@@ -462,6 +561,8 @@ async function main() {
     priorityFee,
     ataRent,
     roundTrips,
+    latencyHorizonsMs: LATENCY_HORIZONS_MS,
+    quoteDrift,
   };
 
   mkdirSync(dirname(OUT_FILE), { recursive: true });

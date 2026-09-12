@@ -83,6 +83,33 @@ export interface LegCost {
 }
 
 /**
+ * Envelhecimento de cotação por latência — o custo do TEMPO.
+ *
+ * Medido no Day 1 recotando o mesmo par e tamanho após cada horizonte.
+ * É um piso empírico de slippage obtido sem executar nada.
+ *
+ * Três conceitos distintos que NUNCA se misturam:
+ *   quotedPriceImpactPct     função do TAMANHO      Fase 1
+ *   quotedDriftBpsByLatency  função do TEMPO        Fase 1
+ *   realizedSlippagePct      execução real          Fase 2
+ */
+export interface DriftPoint {
+  nominalHorizonMs: number;
+  /** Horizonte real fica entre estes dois — o servidor cota em algum ponto no meio. */
+  elapsedMsAtRequest: number;
+  elapsedMsAtResponse: number | null;
+  /** > 0 = receberia mais (a favor). < 0 = receberia menos (contra). */
+  driftBps: number | null;
+}
+
+export interface QuotedDriftByLatency {
+  positionSizeUsdc: number;
+  baseOutAmount: string | null;
+  baseQuoteAtUtc: string | null;
+  points: DriftPoint[];
+}
+
+/**
  * Custo de setup do portfólio — UMA VEZ, nunca por trade.
  *
  * Uma ATA é criada uma vez por (carteira, mint) e reusada por todos os trades
@@ -140,6 +167,20 @@ export interface RoundTripCost {
    */
   totalSunkCostUsdc: number | null;
   totalSunkCostPct: number | null;
+
+  /**
+   * FASE 2 APENAS. Fração de transações enviadas que falharam.
+   *
+   * Permanece null durante todo o paper trading — sem execução real não há
+   * falha para contar, e estimá-la seria inventar número.
+   *
+   * Por que precisa existir já: pelo ADR-001 §2, falha mal contabilizada é
+   * a contaminação mais perigosa do modelo. Uma execução que falha por
+   * saldo reservado não devolvido parece slippage adverso, envenena a
+   * métrica que o kill switch observa, e faz o enxame matar agentes bons.
+   * Na Fase 2 a falha entra no break-even como CUSTO, não como ruído.
+   */
+  txFailureRate: number | null;
 
   /**
    * Movimento de preço necessário só para empatar, em %.
@@ -220,7 +261,54 @@ export function consolidate(params: {
     totalSunkCostUsdc,
     totalSunkCostPct,
     breakEvenMovePct: totalSunkCostPct,
+    txFailureRate: null, // Fase 2 preenche; nunca estimado no paper
   };
+}
+
+/**
+ * Break-even incluindo o custo do tempo.
+ *
+ *   breakEven = swapLoss + networkCost + |drift(latência assumida)|
+ *
+ * O drift é aproximadamente simétrico — metade das vezes ajuda. Usar a
+ * magnitude produz o break-even CONSERVADOR: o que é preciso mover para
+ * empatar mesmo quando a latência jogou contra. É este o número que decide
+ * se a velocidade do loop inviabiliza o desenho.
+ */
+export function breakEvenWithLatency(
+  cost: RoundTripCost,
+  absDriftBpsAtLatency: number
+): number | null {
+  if (cost.totalSunkCostPct == null) return null;
+  return cost.totalSunkCostPct + absDriftBpsAtLatency / 100;
+}
+
+/**
+ * FASE 2: custo efetivo quando parte das transações falha.
+ *
+ * Uma tentativa que falha ainda paga taxa de rede e não gera posição, então
+ * para obter um round trip bem-sucedido são necessárias 1/(1-f) tentativas.
+ *
+ * Lança na Fase 1 de propósito — é o mesmo guard do realizedSlippage, pela
+ * mesma razão: sem execução real este número não existe.
+ */
+export function effectiveCostWithFailures(cost: RoundTripCost): number {
+  if (cost.txFailureRate == null) {
+    throw new Error(
+      "txFailureRate ausente: só existe após execução real (Fase 2). " +
+        "Não estime a taxa de falha durante o paper trading."
+    );
+  }
+  if (cost.txFailureRate < 0 || cost.txFailureRate >= 1) {
+    throw new Error(`txFailureRate fora de [0,1): ${cost.txFailureRate}`);
+  }
+  if (cost.totalSunkCostUsdc == null || cost.networkCostUsdc == null) {
+    throw new Error("custo base incompleto: não dá para somar falhas em cima.");
+  }
+  const f = cost.txFailureRate;
+  // Cada tentativa falha custa só a taxa de rede (não houve swap).
+  const wastedAttempts = f / (1 - f);
+  return cost.totalSunkCostUsdc + wastedAttempts * cost.networkCostUsdc;
 }
 
 /**
