@@ -1,0 +1,28 @@
+# ── Chaves e segredos — NUNCA no repositório ─────────────────────────
+*.key
+*keypair*.json
+wallet.json
+id.json
+.env
+.env.*
+!.env.example
+secrets/
+
+# ── Derivados da análise (regeneráveis a partir do .jsonl) ───────────
+measurements/*.sqlite
+measurements/*.sqlite-journal
+measurements/day1_summary.json
+
+# measurements/*.jsonl é COMMITADO de propósito — é a trilha de auditoria
+# das medições brutas. Sem ela nenhum número do relatório é verificável.
+
+# ── Node ─────────────────────────────────────────────────────────────
+node_modules/
+dist/
+*.tsbuildinfo
+
+# ── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+venv/

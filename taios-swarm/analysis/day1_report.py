@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""
+TAIOS-Swarm — Day 1: relatório de custo de round trip.
+
+Emenda 4: SQLite é a fronteira. O TS mede e grava; toda estatística
+(distribuição, mediana, p90, IC) acontece aqui em Python.
+
+Fluxo:  measurements/day1_costs.jsonl  ->  measurements/day1.sqlite  ->  tabela
+
+Uso:
+    python3 analysis/day1_report.py
+    python3 analysis/day1_report.py --jsonl caminho/day1_costs.jsonl
+
+Só usa stdlib. Sem dependências.
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import statistics
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_JSONL = ROOT / "measurements" / "day1_costs.jsonl"
+DEFAULT_DB = ROOT / "measurements" / "day1.sqlite"
+
+LAMPORTS_PER_SOL = 1_000_000_000
+
+
+# ── Ingestão: JSONL -> SQLite ────────────────────────────────────────
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS run (
+    run_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc       TEXT NOT NULL,
+    rpc_url             TEXT,
+    jupiter_host        TEXT,
+    sol_usdc_price      REAL,
+    base_fee_per_sig    INTEGER,
+    cu_price_median     REAL,
+    cu_price_p90        REAL,
+    cu_price_samples    INTEGER,
+    ata_rent_lamports   INTEGER,
+    UNIQUE(timestamp_utc)
+);
+
+CREATE TABLE IF NOT EXISTS round_trip (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                  INTEGER NOT NULL REFERENCES run(run_id),
+    position_size_usdc      REAL NOT NULL,
+    start_usdc              REAL,
+    end_usdc                REAL,
+    swap_loss_usdc          REAL,
+    swap_loss_pct           REAL,
+    leg1_quoted_impact_pct  REAL,
+    leg2_quoted_impact_pct  REAL,
+    leg1_realized_slip_pct  REAL,   -- FASE 2 apenas; null no paper
+    leg2_realized_slip_pct  REAL,   -- FASE 2 apenas; null no paper
+    leg1_hops               INTEGER,
+    leg2_hops               INTEGER,
+    leg1_venues             TEXT,
+    leg2_venues             TEXT,
+    net_lamports_median     INTEGER,
+    net_lamports_p90        INTEGER,
+    cu_consumed_source      TEXT,
+    error                   TEXT
+);
+"""
+
+
+def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.executescript(SCHEMA)
+
+    if not jsonl_path.exists():
+        print(f"ERRO: {jsonl_path} não existe. Rode scripts/measure-day1.mjs primeiro.")
+        sys.exit(1)
+
+    inserted_runs = 0
+    with open(jsonl_path, "r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"  aviso: linha {line_no} inválida ({e}), ignorada")
+                continue
+
+            pf = rec.get("priorityFee") or {}
+            scoped = pf.get("solUsdc") or pf.get("global") or {}
+
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO run
+                   (timestamp_utc, rpc_url, jupiter_host, sol_usdc_price,
+                    base_fee_per_sig, cu_price_median, cu_price_p90,
+                    cu_price_samples, ata_rent_lamports)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    rec.get("timestampUtc"),
+                    rec.get("rpcUrl"),
+                    rec.get("jupiterHost"),
+                    rec.get("solUsdcQuotedPrice"),
+                    rec.get("baseFeeLamportsPerSignature"),
+                    scoped.get("median"),
+                    scoped.get("p90"),
+                    scoped.get("samples"),
+                    (rec.get("ataRent") or {}).get("lamportsPerAccount"),
+                ),
+            )
+            if cur.rowcount == 0:
+                continue  # run já ingerida
+            inserted_runs += 1
+            run_id = cur.lastrowid
+
+            for rt in rec.get("roundTrips", []):
+                leg1 = rt.get("leg1") or {}
+                leg2 = rt.get("leg2") or {}
+                nf = rt.get("networkFee") or {}
+
+                def total(key):
+                    v = nf.get(key)
+                    return v.get("total") if isinstance(v, dict) else None
+
+                l1m, l2m = total("leg1Median"), total("leg2Median")
+                l1p, l2p = total("leg1P90"), total("leg2P90")
+
+                def venues(leg):
+                    route = (leg or {}).get("route") or {}
+                    return "+".join(
+                        str(h.get("venue")) for h in route.get("legs", []) if h.get("venue")
+                    ) or None
+
+                conn.execute(
+                    """INSERT INTO round_trip
+                       (run_id, position_size_usdc, start_usdc, end_usdc,
+                        swap_loss_usdc, swap_loss_pct,
+                        leg1_quoted_impact_pct, leg2_quoted_impact_pct,
+                        leg1_realized_slip_pct, leg2_realized_slip_pct,
+                        leg1_hops, leg2_hops, leg1_venues, leg2_venues,
+                        net_lamports_median, net_lamports_p90,
+                        cu_consumed_source, error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        run_id,
+                        rt.get("positionSizeUsdc"),
+                        rt.get("startUsdc"),
+                        rt.get("endUsdc"),
+                        rt.get("swapLossUsdc"),
+                        rt.get("swapLossPct"),
+                        leg1.get("quotedPriceImpactPct"),
+                        leg2.get("quotedPriceImpactPct"),
+                        leg1.get("realizedSlippagePct"),  # null na Fase 1, por construção
+                        leg2.get("realizedSlippagePct"),
+                        (leg1.get("route") or {}).get("hops"),
+                        (leg2.get("route") or {}).get("hops"),
+                        venues(leg1),
+                        venues(leg2),
+                        (l1m + l2m) if (l1m is not None and l2m is not None) else None,
+                        (l1p + l2p) if (l1p is not None and l2p is not None) else None,
+                        (leg1.get("compute") or {}).get("cuConsumedSource"),
+                        rt.get("error"),
+                    ),
+                )
+
+    conn.commit()
+    print(f"Ingestão: {inserted_runs} nova(s) execução(ões) -> {db_path}")
+    return conn
+
+
+# ── Estatística ──────────────────────────────────────────────────────
+
+
+def pct(values, p):
+    """Percentil por interpolação linear. Devolve None se vazio."""
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return vals[0]
+    idx = (len(vals) - 1) * p
+    lo, hi = int(idx), min(int(idx) + 1, len(vals) - 1)
+    return vals[lo] + (vals[hi] - vals[lo]) * (idx - lo)
+
+
+def fmt(v, nd=4, dash="—"):
+    return dash if v is None else f"{v:.{nd}f}"
+
+
+def report(conn: sqlite3.Connection) -> None:
+    runs = conn.execute(
+        "SELECT COUNT(*), MIN(timestamp_utc), MAX(timestamp_utc) FROM run"
+    ).fetchone()
+    n_runs, first, last = runs
+
+    ok = conn.execute("SELECT COUNT(*) FROM round_trip WHERE error IS NULL").fetchone()[0]
+    failed = conn.execute("SELECT COUNT(*) FROM round_trip WHERE error IS NOT NULL").fetchone()[0]
+
+    print()
+    print("=" * 78)
+    print("  TAIOS-SWARM — DAY 1: CUSTO REAL DE ROUND TRIP")
+    print("=" * 78)
+    print(f"  Execuções      : {n_runs}   ({first}  ->  {last})")
+    print(f"  Amostras       : {ok} válidas, {failed} com erro")
+
+    if ok == 0:
+        print()
+        print("  NENHUMA AMOSTRA VÁLIDA. Erros registrados:")
+        for (err,) in conn.execute(
+            "SELECT DISTINCT error FROM round_trip WHERE error IS NOT NULL LIMIT 10"
+        ):
+            print(f"    - {err}")
+        print()
+        print("  Sem dado real não há tabela. Corrija o acesso de rede e rode de novo.")
+        print("=" * 78)
+        return
+
+    prices = [
+        r[0] for r in conn.execute("SELECT sol_usdc_price FROM run WHERE sol_usdc_price IS NOT NULL")
+    ]
+    cu_med = [r[0] for r in conn.execute("SELECT cu_price_median FROM run WHERE cu_price_median IS NOT NULL")]
+    cu_p90 = [r[0] for r in conn.execute("SELECT cu_price_p90 FROM run WHERE cu_price_p90 IS NOT NULL")]
+    rents = [r[0] for r in conn.execute("SELECT ata_rent_lamports FROM run WHERE ata_rent_lamports IS NOT NULL")]
+
+    sol_price = statistics.median(prices) if prices else None
+    print(f"  SOL/USDC       : {fmt(sol_price, 4)} (mediana das cotações)")
+    if cu_med:
+        print(
+            f"  Priority fee   : mediana {fmt(statistics.median(cu_med), 0)} | "
+            f"p90 {fmt(statistics.median(cu_p90), 0) if cu_p90 else '—'} micro-lamports/CU"
+        )
+    if rents and sol_price:
+        rent_sol = statistics.median(rents) / LAMPORTS_PER_SOL
+        print(
+            f"  Rent de ATA    : {statistics.median(rents):,.0f} lamports = "
+            f"{rent_sol:.9f} SOL = ${rent_sol * sol_price:.4f} (RECUPERÁVEL)"
+        )
+
+    # ── Tabela principal ──
+    print()
+    print("-" * 78)
+    print("  CUSTO AFUNDADO DE ROUND TRIP POR TAMANHO DE POSIÇÃO")
+    print("  (perda de swap = fee de pool + price impact cotado, ida e volta)")
+    print("-" * 78)
+    print()
+    header = (
+        f"  {'POSIÇÃO':>9} | {'SWAP LOSS':>10} | {'REDE':>9} | "
+        f"{'TOTAL':>9} | {'% POSIÇÃO':>9} | {'BREAK-EVEN':>10}"
+    )
+    print(header)
+    print(f"  {'':>9} | {'mediana $':>10} | {'mediana $':>9} | "
+          f"{'mediana $':>9} | {'mediana':>9} | {'movimento':>10}")
+    print("  " + "-" * 74)
+
+    summary = []
+    sizes = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT position_size_usdc FROM round_trip "
+            "WHERE error IS NULL ORDER BY position_size_usdc"
+        )
+    ]
+
+    for size in sizes:
+        rows = conn.execute(
+            """SELECT swap_loss_usdc, swap_loss_pct, net_lamports_median, net_lamports_p90
+               FROM round_trip WHERE position_size_usdc = ? AND error IS NULL""",
+            (size,),
+        ).fetchall()
+
+        swap_losses = [r[0] for r in rows if r[0] is not None]
+        net_med = [r[2] for r in rows if r[2] is not None]
+        net_p90 = [r[3] for r in rows if r[3] is not None]
+
+        swap_med = pct(swap_losses, 0.5)
+        swap_hi = pct(swap_losses, 0.9)
+
+        net_usd_med = (
+            (pct(net_med, 0.5) / LAMPORTS_PER_SOL) * sol_price
+            if net_med and sol_price
+            else None
+        )
+        net_usd_p90 = (
+            (pct(net_p90, 0.9) / LAMPORTS_PER_SOL) * sol_price
+            if net_p90 and sol_price
+            else None
+        )
+
+        total_med = (swap_med + net_usd_med) if (swap_med is not None and net_usd_med is not None) else None
+        total_p90 = (swap_hi + net_usd_p90) if (swap_hi is not None and net_usd_p90 is not None) else None
+
+        pct_med = (total_med / size * 100) if total_med is not None else None
+        pct_p90 = (total_p90 / size * 100) if total_p90 is not None else None
+
+        print(
+            f"  {'$' + format(size, 'g'):>9} | {fmt(swap_med, 6):>10} | {fmt(net_usd_med, 6):>9} | "
+            f"{fmt(total_med, 6):>9} | {fmt(pct_med, 3) + '%':>9} | {fmt(pct_med, 3) + '%':>10}"
+        )
+
+        summary.append(
+            {
+                "position_usdc": size,
+                "samples": len(rows),
+                "swap_loss_median_usdc": swap_med,
+                "swap_loss_p90_usdc": swap_hi,
+                "network_median_usdc": net_usd_med,
+                "network_p90_usdc": net_usd_p90,
+                "total_sunk_median_usdc": total_med,
+                "total_sunk_p90_usdc": total_p90,
+                "total_sunk_median_pct": pct_med,
+                "total_sunk_p90_pct": pct_p90,
+                "break_even_move_median_pct": pct_med,
+                "break_even_move_p90_pct": pct_p90,
+            }
+        )
+
+    # ── Cenário p90 ──
+    print()
+    print("  " + "-" * 74)
+    print(f"  {'POSIÇÃO':>9} | {'TOTAL p90 $':>12} | {'% POSIÇÃO p90':>14} | {'BREAK-EVEN p90':>15}")
+    print("  " + "-" * 74)
+    for s in summary:
+        print(
+            f"  {'$' + format(s['position_usdc'], 'g'):>9} | {fmt(s['total_sunk_p90_usdc'], 6):>12} | "
+            f"{fmt(s['total_sunk_p90_pct'], 3) + '%':>14} | {fmt(s['break_even_move_p90_pct'], 3) + '%':>15}"
+        )
+
+    # ── Leitura direta ──
+    one = next((s for s in summary if abs(s["position_usdc"] - 1.0) < 1e-9), None)
+    print()
+    print("=" * 78)
+    print("  LEITURA DIRETA — A PERGUNTA QUE DECIDE O PROJETO")
+    print("=" * 78)
+    if one and one["break_even_move_median_pct"] is not None:
+        print()
+        print(f"  Numa posição de US$1,00:")
+        print(f"    custo afundado do round trip : ${one['total_sunk_median_usdc']:.6f} (mediana)")
+        if one["total_sunk_p90_usdc"] is not None:
+            print(f"                                   ${one['total_sunk_p90_usdc']:.6f} (p90)")
+        print()
+        print(f"    MOVIMENTO DE PREÇO NECESSÁRIO SÓ PARA EMPATAR:")
+        print(f"      mediana : {one['break_even_move_median_pct']:.3f}%")
+        if one["break_even_move_p90_pct"] is not None:
+            print(f"      p90     : {one['break_even_move_p90_pct']:.3f}%")
+        print()
+        if rents and sol_price:
+            rent_usd = statistics.median(rents) / LAMPORTS_PER_SOL * sol_price
+            print(
+                f"    Rent de ATA travado numa posição de US$1: ${rent_usd:.4f} "
+                f"({rent_usd / 1.0 * 100:.1f}% da posição)"
+            )
+            print("      -> capital travado recuperável, NÃO custo afundado, mas")
+            print("         imobiliza capital enquanto a posição existe.")
+    else:
+        print("  Sem amostra válida de US$1,00. Rode a medição com esse tamanho.")
+    print()
+    print("=" * 78)
+
+    # ── Rotas observadas ──
+    print()
+    print("  ROTAS OBSERVADAS (do routePlan real, não fixadas)")
+    print("  " + "-" * 74)
+    for size, v1, v2, h1, h2, n in conn.execute(
+        """SELECT position_size_usdc, leg1_venues, leg2_venues, leg1_hops, leg2_hops, COUNT(*)
+           FROM round_trip WHERE error IS NULL
+           GROUP BY position_size_usdc, leg1_venues, leg2_venues
+           ORDER BY position_size_usdc"""
+    ):
+        print(f"  ${format(size, 'g'):<7} USDC->SOL [{h1}] {v1 or '?'}  |  SOL->USDC [{h2}] {v2 or '?'}  (n={n})")
+
+    # ── Garantia da emenda 3 ──
+    leaked = conn.execute(
+        "SELECT COUNT(*) FROM round_trip "
+        "WHERE leg1_realized_slip_pct IS NOT NULL OR leg2_realized_slip_pct IS NOT NULL"
+    ).fetchone()[0]
+    print()
+    print("  " + "-" * 74)
+    if leaked == 0:
+        print("  [OK] realized_slippage vazio em todas as amostras — correto na Fase 1.")
+        print("       quoted_price_impact NÃO foi usado como substituto.")
+    else:
+        print(f"  [ALERTA] {leaked} amostra(s) com realized_slippage preenchido na Fase 1.")
+        print("           Isso não deveria acontecer fora da execução real.")
+
+    out = ROOT / "measurements" / "day1_summary.json"
+    out.write_text(json.dumps({"summary": summary, "sol_usdc_price": sol_price}, indent=2), "utf-8")
+    print(f"\n  Resumo em JSON: {out}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--jsonl", type=Path, default=DEFAULT_JSONL)
+    ap.add_argument("--db", type=Path, default=DEFAULT_DB)
+    args = ap.parse_args()
+
+    conn = ingest(args.jsonl, args.db)
+    report(conn)
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()

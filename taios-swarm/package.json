@@ -1,0 +1,19 @@
+{
+  "name": "taios-swarm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Enxame evolutivo de micro-arbitragem em Solana — Fase 1: paper only",
+  "scripts": {
+    "measure:day1": "node scripts/measure-day1.mjs",
+    "report:day1": "python3 analysis/day1_report.py",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
