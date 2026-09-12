@@ -286,13 +286,37 @@ function feesToUsdc(byMint, solUsdcPrice) {
 }
 
 /**
+ * Taxa efetiva do pool NAQUELE salto, direto do routePlan.
+ *
+ * A taxa e cobrada em feeMint, que pode ser o mint de entrada ou o de saida
+ * do salto — a base da divisao muda conforme o caso. Feito certo, o numero
+ * que sai e o TIER do pool: 25 bps = Raydium classico, 1-5 bps = CLMM barato.
+ *
+ * Isto e RESULTADO do Day 1, nao premissa herdada. Nada de assumir 0,25%.
+ */
+function hopFeeRateBps(s) {
+  if (s.feeAmount == null || !s.feeMint) return null;
+  const fee = Number(s.feeAmount);
+  if (!Number.isFinite(fee) || fee < 0) return null;
+  let base = null;
+  if (s.feeMint === s.inputMint) base = Number(s.inAmount);
+  else if (s.feeMint === s.outputMint) base = Number(s.outAmount);
+  if (base == null || !Number.isFinite(base) || base <= 0) return null;
+  return (fee / base) * 10_000;
+}
+
+/**
  * Emenda 5: lê o routePlan real devolvido pelo roteador.
- * Nada de fixar 0,25% do Raydium — registra venue/fee por salto.
+ * Nada de fixar 0,25% do Raydium — registra venue/fee/tier por salto.
  */
 function extractRoute(quote) {
   const plan = quote.routePlan || [];
   return {
     hops: plan.length,
+    // Assinatura: permite agrupar tamanhos que atravessaram a MESMA
+    // liquidez. Comparar perda entre rotas diferentes mistura taxa de
+    // venue com impacto de tamanho e nao testa nada.
+    signature: routeSignature(quote),
     legs: plan.map((step) => {
       const s = step.swapInfo || {};
       return {
@@ -304,6 +328,7 @@ function extractRoute(quote) {
         outAmount: s.outAmount ?? null,
         feeAmount: s.feeAmount ?? null,
         feeMint: s.feeMint ?? null,
+        feeRateBps: hopFeeRateBps(s),
         percent: step.percent ?? null,
       };
     }),

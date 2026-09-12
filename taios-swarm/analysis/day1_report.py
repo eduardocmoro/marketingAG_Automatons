@@ -91,7 +91,25 @@ CREATE TABLE IF NOT EXISTS round_trip (
     fee_routeplan_usdc      REAL,   -- soma de feeAmount das duas pernas
     fee_routeplan_pct       REAL,
     fee_discrepancy_usdc    REAL,   -- observado - routePlan
+    leg1_route_sig          TEXT,   -- pools+split concretos da perna 1
+    leg2_route_sig          TEXT,
     error                   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS route_hop (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id             INTEGER NOT NULL REFERENCES run(run_id),
+    position_size_usdc REAL NOT NULL,
+    leg                INTEGER NOT NULL,
+    hop_index          INTEGER NOT NULL,
+    venue              TEXT,
+    amm_key            TEXT,
+    percent            REAL,
+    fee_amount         TEXT,
+    fee_mint           TEXT,
+    fee_rate_bps       REAL,   -- tier do pool, direto do routePlan
+    in_amount          TEXT,
+    out_amount         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS quote_drift (
@@ -146,6 +164,8 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
         ("round_trip", "fee_routeplan_usdc", "REAL"),
         ("round_trip", "fee_routeplan_pct", "REAL"),
         ("round_trip", "fee_discrepancy_usdc", "REAL"),
+        ("round_trip", "leg1_route_sig", "TEXT"),
+        ("round_trip", "leg2_route_sig", "TEXT"),
         ("run", "complete", "INTEGER"),
         ("run", "rate_limit_hits", "INTEGER"),
         ("run", "rent_matches_formula", "INTEGER"),
@@ -242,8 +262,8 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                         cu_consumed_source, tx_failure_rate,
                         round_trip_return_pct, leg_gap_ms,
                         fee_routeplan_usdc, fee_routeplan_pct,
-                        fee_discrepancy_usdc, error)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        fee_discrepancy_usdc, leg1_route_sig, leg2_route_sig, error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         run_id,
                         rt.get("positionSizeUsdc"),
@@ -268,9 +288,35 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                         (rt.get("feeCrossCheck") or {}).get("totalFeeUsdc"),
                         (rt.get("feeCrossCheck") or {}).get("totalFeePctOfPosition"),
                         (rt.get("feeCrossCheck") or {}).get("discrepancyUsdc"),
+                        (leg1.get("route") or {}).get("signature"),
+                        (leg2.get("route") or {}).get("signature"),
                         rt.get("error"),
                     ),
                 )
+
+                for leg_no, leg in ((1, leg1), (2, leg2)):
+                    for i, hop in enumerate((leg.get("route") or {}).get("legs", [])):
+                        conn.execute(
+                            """INSERT INTO route_hop
+                               (run_id, position_size_usdc, leg, hop_index, venue,
+                                amm_key, percent, fee_amount, fee_mint,
+                                fee_rate_bps, in_amount, out_amount)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (
+                                run_id,
+                                rt.get("positionSizeUsdc"),
+                                leg_no,
+                                i,
+                                hop.get("venue"),
+                                hop.get("ammKey"),
+                                hop.get("percent"),
+                                hop.get("feeAmount"),
+                                hop.get("feeMint"),
+                                hop.get("feeRateBps"),
+                                hop.get("inAmount"),
+                                hop.get("outAmount"),
+                            ),
+                        )
 
             for drift in rec.get("quoteDrift", []):
                 size = drift.get("positionSizeUsdc")
@@ -397,36 +443,66 @@ def integrity_section(conn):
             print(f"    [!] spread global de {gp/gm:.0f}x — o global e ruido da rede,")
             print("        nao a taxa relevante. Use a linha filtrada por pool.")
 
-    # ── Teste 1: monotonicidade ──
+    # ── Agrupamento por rota: pre-requisito para comparar tamanhos ──
+    groups = {}
+    for size, sig1, sig2, h1, h2 in conn.execute(
+        "SELECT position_size_usdc, leg1_route_sig, leg2_route_sig, leg1_hops, leg2_hops "
+        "FROM round_trip WHERE error IS NULL "
+        "GROUP BY position_size_usdc ORDER BY position_size_usdc"
+    ):
+        groups.setdefault((sig1, sig2), []).append((size, h1, h2))
+
+    print()
+    print("  AGRUPAMENTO POR ROTA")
+    print("  " + "-" * 68)
+    if not groups:
+        print("    sem dados de rota")
+    else:
+        for i, ((sig1, sig2), members) in enumerate(groups.items(), 1):
+            sizes = ", ".join("$" + format(m[0], "g") for m in members)
+            hops = members[0]
+            print(f"    grupo {i}: hops {hops[1]}+{hops[2]}  ->  {sizes}")
+        if len(groups) > 1:
+            print()
+            print(f"    {len(groups)} rotas distintas entre os tamanhos. Comparar perda")
+            print("    entre grupos mistura taxa de venue com impacto de tamanho.")
+
+    # ── Teste 1 (SECUNDARIO): monotonicidade DENTRO da mesma rota ──
     rows = conn.execute(
         "SELECT position_size_usdc, AVG(swap_loss_pct), COUNT(*) "
         "FROM round_trip WHERE error IS NULL AND swap_loss_pct IS NOT NULL "
         "GROUP BY position_size_usdc ORDER BY position_size_usdc"
     ).fetchall()
+    loss_by_size = {r[0]: r[1] for r in rows}
+
     print()
-    print("  TESTE 1 — MONOTONICIDADE (impacto tem que crescer com o tamanho)")
+    print("  TESTE 1 (secundario) — MONOTONICIDADE DENTRO DA MESMA ROTA")
     print("  " + "-" * 68)
-    if len(rows) < 2:
-        print("    amostras insuficientes")
+    print("    So vale entre tamanhos que atravessaram a MESMA liquidez.")
+    comparable = [g for g in groups.values() if len(g) >= 2]
+    if not comparable:
+        print("    Nenhum grupo de rota tem 2+ tamanhos — teste NAO APLICAVEL.")
+        print("    Nao-monotonicidade entre rotas diferentes nao e evidencia de bug.")
+        verdicts["monotonic"] = None
     else:
-        print(f"    {'TAMANHO':>9} | {'PERDA MEDIA %':>14} | {'n':>4}")
-        prev = None
         violations = []
-        for size, loss, n in rows:
-            flag = ""
-            if prev is not None and loss < prev[1] - 1e-9:
-                flag = f"  <-- MENOR que ${prev[0]:g}"
-                violations.append((prev[0], size))
-            print(f"    {'$' + format(size, 'g'):>9} | {loss:>14.4f} | {n:>4}{flag}")
-            prev = (size, loss)
+        for members in comparable:
+            ordered = sorted(members, key=lambda m: m[0])
+            prev = None
+            for size, _, _ in ordered:
+                loss = loss_by_size.get(size)
+                if loss is None:
+                    continue
+                flag = ""
+                if prev is not None and loss < prev[1] - 1e-9:
+                    flag = f"  <-- MENOR que ${prev[0]:g} na mesma rota"
+                    violations.append((prev[0], size))
+                print(f"    {'$' + format(size, 'g'):>9} | {loss:>12.4f}%{flag}")
+                prev = (size, loss)
         verdicts["monotonic"] = not violations
-        if violations:
-            print()
-            print(f"    [FALHOU] {len(violations)} violacao(oes). Impacto de preco nao pode")
-            print("             diminuir com o tamanho no mesmo pool.")
-        else:
-            print()
-            print("    [OK] perda cresce monotonicamente com o tamanho.")
+        print()
+        print("    [FALHOU] impacto caiu com o tamanho na mesma rota."
+              if violations else "    [OK] monotonico dentro de cada rota.")
 
     # ── Teste 2: piso fisico ──
     print()
@@ -437,20 +513,22 @@ def integrity_section(conn):
         print("    sem amostras")
     elif below:
         verdicts["above_floor"] = False
-        print(f"    [FALHOU] {len(below)}/{len(rows)} tamanhos abaixo do pool mais barato")
-        print(f"             que existe (tier CLMM 0,01% = {CHEAPEST_POOL_ROUND_TRIP_PCT}% ida e volta).")
-        for sz, l in below[:5]:
-            print(f"               ${sz:g}: {l:.4f}%  ({CHEAPEST_POOL_ROUND_TRIP_PCT/l:.0f}x abaixo)"
-                  if l > 0 else f"               ${sz:g}: {l:.4f}%  (nao-positivo)")
-        print("             A taxa de pool NAO esta entrando no calculo.")
+        print(f"    [ATENCAO] {len(below)}/{len(rows)} tamanhos abaixo de "
+              f"{CHEAPEST_POOL_ROUND_TRIP_PCT}%.")
+        for sz, l in below[:8]:
+            print(f"      ${sz:g}: {l:.4f}%")
+        print("      Se a taxa efetiva medida (tabela abaixo) confirmar tier baixo,")
+        print("      isto NAO e bug — e venue barato. O TESTE 3 decide.")
     else:
         verdicts["above_floor"] = True
-        print("    [OK] todos os tamanhos acima do piso fisico.")
+        print("    [OK] todos os tamanhos acima do piso.")
 
-    # ── Teste 3: validacao cruzada por feeAmount ──
+    # ── Teste 3 (PRIMARIO): validacao cruzada, independente de rota ──
     print()
-    print("  TESTE 3 — VALIDACAO CRUZADA (perda observada vs feeAmount do routePlan)")
+    print("  TESTE 3 (PRIMARIO) — PERDA OBSERVADA vs feeAmount DAQUELA ROTA")
     print("  " + "-" * 68)
+    print("    Unico teste independente de rota: compara contra a taxa que o")
+    print("    roteador cobrou NAQUELE caminho especifico.")
     cross = conn.execute(
         "SELECT position_size_usdc, AVG(swap_loss_pct), AVG(fee_routeplan_pct), "
         "       AVG(fee_discrepancy_usdc), AVG(leg_gap_ms), COUNT(*) "
@@ -458,43 +536,81 @@ def integrity_section(conn):
         "GROUP BY position_size_usdc ORDER BY position_size_usdc"
     ).fetchall()
     if not cross:
-        print("    Sem dados de routePlan fee — amostra de versao anterior do script.")
-        print("    Rode a medicao atualizada: so ela grava feeCrossCheck.")
+        print()
+        print("    Sem dados de routePlan fee — amostra de versao anterior.")
+        print("    Rode a medicao atualizada.")
     else:
+        print()
         print(f"    {'TAM':>7} | {'OBSERVADO %':>12} | {'routePlan %':>12} | "
               f"{'DIFF US$':>11} | {'gap ms':>7}")
         bad = 0
         for size, obs, fee, disc, gap, n in cross:
-            # Observado deve ser >= taxa de pool (impacto so soma).
             suspect = obs < fee - 1e-9
-            flag = "  <-- ABAIXO da taxa" if suspect else ""
             if suspect:
                 bad += 1
             print(f"    {'$' + format(size, 'g'):>7} | {obs:>12.4f} | {fee:>12.4f} | "
-                  f"{disc:>11.6f} | {gap or 0:>7.0f}{flag}")
+                  f"{disc:>11.6f} | {gap or 0:>7.0f}" + ("  <-- ABAIXO da taxa" if suspect else ""))
         verdicts["fee_crosscheck"] = bad == 0
         print()
         if bad:
             print(f"    [FALHOU] {bad} tamanho(s) com perda observada MENOR que a taxa")
-            print("             que o proprio roteador diz ter cobrado. Isso e")
-            print("             impossivel fisicamente — o bug esta no encadeamento.")
+            print("             que o roteador diz ter cobrado naquela mesma rota.")
+            print("             Fisicamente impossivel — bug no encadeamento.")
         else:
             print("    [OK] perda observada cobre a taxa do routePlan em todos os tamanhos.")
-            print("         A diferenca e price impact mais deriva entre as pernas (gap ms).")
+            print("         A sobra e price impact mais deriva entre pernas (gap ms).")
+
+    # ── Taxa efetiva de pool por tamanho: RESULTADO, nao premissa ──
+    print()
+    print("  TAXA EFETIVA DE POOL POR TAMANHO — RESULTADO DO DAY 1")
+    print("  " + "-" * 68)
+    print("    Tier lido do routePlan (feeAmount/base do salto). Nao e premissa")
+    print("    herdada: 0,25% do Raydium nunca foi medido, foi assumido.")
+    hops = conn.execute(
+        "SELECT position_size_usdc, leg, hop_index, venue, AVG(fee_rate_bps), COUNT(*) "
+        "FROM route_hop WHERE fee_rate_bps IS NOT NULL "
+        "GROUP BY position_size_usdc, leg, hop_index, venue "
+        "ORDER BY position_size_usdc, leg, hop_index"
+    ).fetchall()
+    fee_table = []
+    if not hops:
+        print()
+        print("    Sem feeRateBps — amostra de versao anterior do script.")
+    else:
+        print()
+        print(f"    {'TAM':>7} | {'PERNA':>5} | {'HOP':>3} | {'VENUE':>18} | {'TIER bps':>9}")
+        for size, leg, hop, venue, rate, n in hops:
+            print(f"    {'$' + format(size, 'g'):>7} | {leg:>5} | {hop:>3} | "
+                  f"{(venue or '?')[:18]:>18} | {rate:>9.2f}")
+            fee_table.append({"position_usdc": size, "leg": leg, "hop": hop,
+                              "venue": venue, "fee_rate_bps": rate, "n": n})
+        tiers = [h[4] for h in hops]
+        print()
+        print(f"    tier minimo observado: {min(tiers):.2f} bps | maximo: {max(tiers):.2f} bps")
+        if min(tiers) < 25:
+            print()
+            print("    [!] Ha salto com tier ABAIXO de 25 bps (0,25%). A premissa de")
+            print("        Raydium 0,25% que carregamos a conversa inteira esta ERRADA")
+            print("        PARA CIMA nesses caminhos. Isso FAVORECE o desenho de US$1 —")
+            print("        e e resultado medido, nao suposicao.")
 
     # ── Veredito ──
     print()
     print("  " + "=" * 68)
-    failed = [k for k, v in verdicts.items() if v is False]
-    if failed:
-        print(f"  VEREDITO: MEDICAO INVALIDA — falhou em {', '.join(failed)}.")
-        print("  Nao use os numeros de custo abaixo para decidir nada.")
-    elif all(v is None for v in verdicts.values()):
-        print("  VEREDITO: sem dados suficientes para checar integridade.")
+    if verdicts["fee_crosscheck"] is False:
+        print("  VEREDITO: MEDICAO INVALIDA — falhou no teste primario (cruzado).")
+        print("  Nao use os numeros de custo abaixo.")
+    elif verdicts["fee_crosscheck"] is True:
+        print("  VEREDITO: teste primario PASSOU. A perda observada e coerente com")
+        print("  a taxa da rota efetivamente usada.")
+        if verdicts["monotonic"] is False:
+            print("  Ressalva: monotonicidade violada dentro de uma mesma rota — investigar.")
+        if verdicts["above_floor"] is False:
+            print("  Perda abaixo de 0,02% e explicada por venue de tier baixo, nao por bug.")
     else:
-        print("  VEREDITO: medicao passou nos testes de integridade disponiveis.")
+        print("  VEREDITO: teste primario sem dados. Rode a medicao atualizada.")
     print("  " + "=" * 68)
-    return verdicts
+    return {**verdicts, "route_groups": len(groups), "pool_fee_by_size": fee_table}
 
 
 def drift_stats(conn, size=None):

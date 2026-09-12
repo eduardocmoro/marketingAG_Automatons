@@ -276,20 +276,41 @@ Round trip é medido de ponta a ponta: entra com N USDC, a perna 2 usa exatament
 o `outAmount` da perna 1, sai com M USDC. `swapLoss = N − M` captura fee de pool e
 price impact das duas direções sem modelar cada pool à mão.
 
+### Taxa de pool é RESULTADO do Day 1, não premissa
+
+A conversa inteira carregou "Raydium 0,25%, round trip 0,5%" como dado. **Isso
+nunca foi medido — foi assumido.** O routePlan devolve `feeAmount` e `feeMint`
+por salto, e daí sai o **tier efetivo do pool** que aquele tamanho realmente
+atravessou:
+
+```
+feeMint == inputMint  →  tier = feeAmount / inAmount
+feeMint == outputMint →  tier = feeAmount / outAmount
+```
+
+O relatório imprime o tier por (tamanho, perna, salto, venue). Se micro-ordens
+estiverem indo para CLMM de 1–5 bps em vez de Raydium 25 bps, a premissa
+herdada está **errada para cima** e o desenho de US$1 fica mais viável do que
+supúnhamos — medido, não suposto.
+
 ### Integridade antes de leitura
 
-O relatório roda três testes ANTES de qualquer número de custo, e bloqueia a
-leitura se algum falhar:
+**Jupiter roteia por tamanho.** Cada tamanho pode atravessar venue e split
+diferentes, e comparar perda entre rotas distintas mistura taxa de venue com
+impacto de tamanho. O relatório agrupa os tamanhos por assinatura de rota
+(pools concretos + split) **antes** de qualquer teste.
 
-1. **Monotonicidade** — impacto de preço tem que crescer com o tamanho. US$500
-   sair melhor que US$0,50 no mesmo pool é fisicamente impossível.
-2. **Piso físico** — perda de round trip abaixo de **0,02%** (tier CLMM mais
-   barato que existe, 0,01% por swap) significa que a taxa de pool não entrou
-   no cálculo.
-3. **Validação cruzada** — a soma de `feeAmount` do `routePlan` das duas pernas
-   tem que ser coberta pela perda observada. É um caminho **independente** do
-   encadeamento de quotes: se a perda observada for menor que a taxa que o
-   próprio roteador diz ter cobrado, o bug está no nosso cálculo.
+1. **TESTE 3 — validação cruzada (PRIMÁRIO).** A soma de `feeAmount` do
+   `routePlan` das duas pernas tem que ser coberta pela perda observada. É o
+   **único teste independente de rota**, porque compara contra a taxa daquele
+   caminho específico. Perda observada menor que a taxa que o próprio roteador
+   diz ter cobrado é fisicamente impossível — aí o bug é do nosso cálculo.
+2. **TESTE 1 — monotonicidade (SECUNDÁRIO).** Só se aplica **dentro** do
+   subconjunto de tamanhos que compartilham a mesma assinatura de rota. Entre
+   rotas diferentes, não-monotonicidade **não é evidência de bug**.
+3. **TESTE 2 — piso físico.** Perda abaixo de 0,02% é sinalizada, mas se a taxa
+   efetiva medida confirmar tier baixo, **não é bug — é venue barato**. Quem
+   decide é o TESTE 3.
 
 As duas quotes do round trip são disparadas **coladas no tempo**, e `legGapMs`
 registra o intervalo. Construir a tx de swap e simular entre as pernas metia
