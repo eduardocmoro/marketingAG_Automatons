@@ -158,7 +158,14 @@ O horizonte real de cada ponto fica entre `elapsedMsAtRequest` e
 `elapsedMsAtResponse` — os dois são registrados em vez de assumir que a espera
 nominal foi exata.
 
-### Entrega do Day 1: uma curva, não um número
+### Entrega do Day 1
+
+1. **Tabela de custo determinístico** — `swapLoss + networkCost` por tamanho,
+   mediana e p90. É o resultado sólido do Day 1.
+2. **Calibração `quote_drift` vs sonda** — quanto do drift observado é movimento
+   de preço e quanto é efeito de tamanho.
+3. **Break-even determinístico em US$1** — a leitura direta.
+4. **Curva de reversão** — marcada PRELIMINAR, fechada no Day 2–3 com histórico.
 
 Break-even em função da **tolerância de slippage**, por tamanho de trade:
 
@@ -173,29 +180,68 @@ Break-even em função da **tolerância de slippage**, por tamanho de trade:
 
 A curva tem dois braços:
 
-- **esquerdo** (tolerância apertada) → reversão, gás desperdiçado. **Mensurável
-  agora.**
-- **direito** (tolerância larga) → sandwich extrai até o limite autorizado, e o
-  drift deixa de ser simétrico e vira adversarial. **Não mensurável na Fase 1.**
+- **esquerdo** (tolerância apertada) → reversão, gás desperdiçado. **Medido.**
+- **direito** (tolerância larga) → sandwich. Resolvido por **economia do
+  atacante**, não por medição de MEV.
 
-O braço esquerdo sozinho é monotonicamente decrescente e **não tem mínimo** — o
-mínimo só aparece ao fechar o braço direito com o teto de sandwich. Por isso o
-relatório marca explicitamente que o mínimo vale sob a hipótese de que todo trade
-é sanduichado até o limite. Em posição de US$1 a extração pode não compensar o gás
-do atacante, o que empurraria o mínimo para a direita — **hipótese a testar na
-Fase 2, não resultado do Day 1**.
+#### Vantagem estrutural da microposição
 
-#### Resolução de cauda
+O braço direito não precisa de medição de sandwich: resolve-se pela aritmética do
+atacante. Sanduichar exige **duas transações** e ganhar uma **corrida de priority
+fee**. A extração é `posição × tolerância`. Logo:
 
-`P(revert)` é uma probabilidade de cauda: com `n` amostras a resolução é `1/n`.
-Tolerâncias onde nenhuma amostra estourou aparecem marcadas com `<` — o valor é
-um **teto de 1/n, não zero**. Quando mais da metade da grade cai nessa condição, o
-relatório avisa que o mínimo não é confiável.
+```
+custo do atacante = 2 × (base_fee × sigs + cu_price_corrida × cu)
+limiar(tol)       = custo_do_atacante × 10000 / tol
+tolerância máxima segura = custo_do_atacante × 10000 / posição
+```
 
-Cada bloco de 8 amostras gera 8 pontos de drift por horizonte (um por tamanho de
-trade, em janelas de ~5s disjuntas). Para resolver reversão de 0,5% são precisos
-~200 pontos ≈ 25 blocos; para 0,1%, ~1000 pontos. Decida a grade de tolerância
-pelo que você precisa resolver.
+Em posição de US$1 com tolerância de 50 bps a extração é US$0,005 — o atacante
+paga duas transações por isso e **não fecha**. O desenho opera **abaixo do piso
+econômico do MEV**, e isso é vantagem estrutural da microposição, não achado de
+estratégia.
+
+O relatório reporta a **tolerância máxima que mantém a posição sob o piso**. Esse
+é o número operacional: abaixo dele a curva é monotonicamente decrescente e o que
+importa é a menor tolerância que zera reversão, não um mínimo interno.
+
+Premissas e direção do viés (em `mevEconomicFloor`, `src/costs/model.ts`): assumir
+extração total superestima o ganho do atacante e ignorar custo de capital,
+inventário e falha do próprio ataque subestima seu custo — ambos empurram o limiar
+para **baixo**, então tratar a faixa como segura só quando ela estiver
+confortavelmente abaixo. Bundles Jito trocam a corrida por tip: o custo muda de
+forma, não some.
+
+#### Resolução de cauda: n bruto vs n efetivo
+
+`P(revert)` é probabilidade de cauda. Observações de tamanhos dentro do mesmo
+bloco são **contíguas no tempo**, e volatilidade forma cluster — então não são
+independentes. O relatório mede a autocorrelação de lag 1 de `|drift|` na ordem de
+medição e reporta os dois:
+
+```
+n_eff = n × (1 − ρ) / (1 + ρ)      (limitado a n: ρ < 0 não cria amostra nova)
+```
+
+A resolução de cauda sai do **n efetivo**, não do bruto. Tolerâncias onde nenhuma
+amostra estourou aparecem com `<` — teto de `1/n_eff`, não zero.
+
+**Não recalcule o n por raciocínio** — o relatório conta direto do `jsonl` e
+imprime o valor real por horizonte.
+
+### Divisão de papéis: polling vs histórico
+
+Estender o polling para centenas de blocos é ineficiente — 16h de coleta para
+algumas centenas de pontos. A cauda de drift adverso sai de **histórico de trades
+SOL/USDC**, com ordens de magnitude mais amostras, e o data layer do Day 2–3 já
+coleta isso.
+
+| Fonte | n | Papel |
+|---|---|---|
+| polling (Day 1) | pequeno | calibrar `quote_drift` vs sonda de notional desprezível |
+| histórico (Day 2–3) | grande | distribuição de cauda e `revert_rate_floor` definitivo |
+
+Por isso a curva do Day 1 sai marcada **PRELIMINAR** e **não bloqueia nada**.
 
 ### `slippageBps` é parâmetro evoluído, não constante
 

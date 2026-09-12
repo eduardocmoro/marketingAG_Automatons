@@ -332,15 +332,63 @@ export function expectedCostWithReverts(params: {
 
 /**
  * Teto de extração por sandwich: no limite, um atacante extrai toda a
- * tolerância autorizada.
- *
- * NÃO é medição — é o pior caso aritmético. A frequência real de sandwich
- * só sai da Fase 2. Serve para fechar o braço direito da curva: sem ele a
- * curva de custo por tolerância é monotonicamente decrescente e não tem
- * mínimo, o que é um artefato de só medir o braço esquerdo.
+ * tolerância autorizada. NÃO é medição — é o pior caso aritmético.
  */
 export function sandwichUpperBoundUsdc(positionUsdc: number, slippageBps: number): number {
   return positionUsdc * (slippageBps / 10_000);
+}
+
+/**
+ * Piso econômico do MEV.
+ *
+ * O braço direito da curva não precisa de medição de sandwich: resolve-se
+ * pela economia do atacante. Sanduichar exige DUAS transações e ganhar uma
+ * corrida de priority fee. Abaixo de certo tamanho de posição a extração não
+ * cobre esse custo e o ataque simplesmente não fecha.
+ *
+ *   extração(pos, tol)  = pos × tol/10000
+ *   custo do atacante   = 2 × (base_fee × sigs + cu_price_corrida × cu)
+ *   limiar(tol)         = custo_do_atacante × 10000 / tol
+ *
+ * Abaixo do limiar a curva é monotonicamente decrescente em tol e não tem
+ * mínimo: o que se reporta é a MENOR tolerância que zera reversão, não um
+ * ponto de equilíbrio.
+ *
+ * Premissas, e a direção do viés de cada uma:
+ *  - atacante extrai a tolerância inteira -> superestima extração
+ *    -> limiar menor -> conservador (assume MEV viável mais cedo)
+ *  - priority fee de corrida no p90 medido -> pode subestimar uma guerra real
+ *  - ignora custo de capital, risco de inventário e falha do próprio ataque
+ *    -> subestima custo do atacante -> limiar menor -> conservador
+ *  - bundles Jito trocam a corrida por tip; o custo muda de forma, não some
+ *
+ * O viés líquido empurra o limiar para BAIXO, então tratar a faixa de
+ * operação como segura só quando ela estiver confortavelmente abaixo dele.
+ */
+export interface MevEconomicFloor {
+  slippageToleranceBps: number;
+  attackerCostUsdc: number;
+  /** Posição abaixo da qual a extração não cobre o custo do atacante. */
+  thresholdPositionUsdc: number;
+  /** true quando a posição operada fica sob o piso — sandwich não fecha. */
+  positionBelowFloor: boolean;
+}
+
+export function mevEconomicFloor(params: {
+  positionUsdc: number;
+  slippageBps: number;
+  /** Taxa de rede de UMA transação de swap, em USDC, ao nível de corrida. */
+  attackerTxCostUsdc: number;
+}): MevEconomicFloor {
+  const { positionUsdc, slippageBps, attackerTxCostUsdc } = params;
+  const attackerCostUsdc = 2 * attackerTxCostUsdc; // front-run + back-run
+  const thresholdPositionUsdc = (attackerCostUsdc * 10_000) / slippageBps;
+  return {
+    slippageToleranceBps: slippageBps,
+    attackerCostUsdc,
+    thresholdPositionUsdc,
+    positionBelowFloor: positionUsdc < thresholdPositionUsdc,
+  };
 }
 
 /**

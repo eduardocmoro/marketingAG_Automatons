@@ -44,6 +44,12 @@ const TRADE_SIZES_USDC = [0.5, 1, 2, 5, 10, 50, 100, 500];
 // Slot time da Solana é ~350ms — uma quote envelhece dentro do loop.
 const LATENCY_HORIZONS_MS = [250, 500, 1000, 2000, 5000];
 
+// Sonda de referência: notional pequeno o bastante para o price impact ser
+// desprezível, cotado em par com cada quote de tamanho real. NÃO é um mid
+// de oráculo — é uma quote executável de notional mínimo, e o nome reflete
+// isso. Serve para separar movimento de preço de efeito de tamanho.
+const MID_PROBE_USDC = 0.1;
+
 const RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 
 // Conta pública apenas para montar/simular a tx e obter unitsConsumed.
@@ -316,23 +322,35 @@ async function measureAtaRent() {
  */
 async function measureQuoteDrift(sizeUsdc) {
   const inRaw = toRaw(sizeUsdc, USDC_DECIMALS);
+  const probeRaw = toRaw(MID_PROBE_USDC, USDC_DECIMALS);
   const result = {
     positionSizeUsdc: sizeUsdc,
+    midProbeUsdc: MID_PROBE_USDC,
     baseOutAmount: null,
+    baseProbeOutAmount: null,
     baseQuoteAtUtc: null,
     points: [],
     error: null,
   };
 
   let base;
+  let baseProbe = null;
   let baseDoneAt;
   try {
     const t0 = Date.now();
     const q0 = await jupQuote(USDC_MINT, SOL_MINT, inRaw);
-    baseDoneAt = Date.now();
     base = Number(q0.outAmount);
     result.baseOutAmount = q0.outAmount;
     result.baseQuoteAtUtc = new Date(t0).toISOString();
+    // Sonda pareada, logo em seguida — a poucos ms da quote de tamanho.
+    try {
+      const p0 = await jupQuote(USDC_MINT, SOL_MINT, probeRaw);
+      baseProbe = Number(p0.outAmount);
+      result.baseProbeOutAmount = p0.outAmount;
+    } catch {
+      baseProbe = null;
+    }
+    baseDoneAt = Date.now();
   } catch (e) {
     result.error = e.message.slice(0, 200);
     return result;
@@ -349,12 +367,31 @@ async function measureQuoteDrift(sizeUsdc) {
       const q = await jupQuote(USDC_MINT, SOL_MINT, inRaw);
       const recvAt = Date.now();
       const out = Number(q.outAmount);
+
+      // Sonda pareada: mesmo instante, notional desprezível. A diferença
+      // entre os dois drifts é o componente atribuível ao TAMANHO.
+      let midDriftBps = null;
+      let probeOut = null;
+      if (baseProbe != null) {
+        try {
+          const p = await jupQuote(USDC_MINT, SOL_MINT, probeRaw);
+          probeOut = p.outAmount;
+          midDriftBps = ((Number(p.outAmount) - baseProbe) / baseProbe) * 10_000;
+        } catch {
+          midDriftBps = null;
+        }
+      }
+
+      const driftBps = ((out - base) / base) * 10_000;
       result.points.push({
         nominalHorizonMs: horizon,
         elapsedMsAtRequest: sentAt - baseDoneAt,
         elapsedMsAtResponse: recvAt - baseDoneAt,
         outAmount: q.outAmount,
-        driftBps: ((out - base) / base) * 10_000,
+        driftBps,
+        probeOutAmount: probeOut,
+        midDriftBps,
+        sizeComponentBps: midDriftBps != null ? driftBps - midDriftBps : null,
         error: null,
       });
     } catch (e) {
@@ -364,6 +401,9 @@ async function measureQuoteDrift(sizeUsdc) {
         elapsedMsAtResponse: null,
         outAmount: null,
         driftBps: null,
+        probeOutAmount: null,
+        midDriftBps: null,
+        sizeComponentBps: null,
         error: e.message.slice(0, 150),
       });
     }

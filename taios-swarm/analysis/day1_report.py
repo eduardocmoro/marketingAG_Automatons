@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS quote_drift (
     elapsed_ms_request   INTEGER,
     elapsed_ms_response  INTEGER,
     drift_bps            REAL,
+    mid_drift_bps        REAL,   -- sonda de notional desprezível, pareada
+    size_component_bps   REAL,   -- drift_bps - mid_drift_bps
     error                TEXT
 );
 """
@@ -115,7 +117,11 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
     # Bases criadas antes destas colunas continuam utilizáveis.
-    for table, col, decl in [("round_trip", "tx_failure_rate", "REAL")]:
+    for table, col, decl in [
+        ("round_trip", "tx_failure_rate", "REAL"),
+        ("quote_drift", "mid_drift_bps", "REAL"),
+        ("quote_drift", "size_component_bps", "REAL"),
+    ]:
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         except sqlite3.OperationalError:
@@ -228,8 +234,9 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                     conn.execute(
                         """INSERT INTO quote_drift
                            (run_id, position_size_usdc, nominal_horizon_ms,
-                            elapsed_ms_request, elapsed_ms_response, drift_bps, error)
-                           VALUES (?,?,?,?,?,?,?)""",
+                            elapsed_ms_request, elapsed_ms_response, drift_bps,
+                            mid_drift_bps, size_component_bps, error)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
                         (
                             run_id,
                             size,
@@ -237,6 +244,8 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                             pt.get("elapsedMsAtRequest"),
                             pt.get("elapsedMsAtResponse"),
                             pt.get("driftBps"),
+                            pt.get("midDriftBps"),
+                            pt.get("sizeComponentBps"),
                             pt.get("error"),
                         ),
                     )
@@ -298,6 +307,113 @@ def drift_stats(conn, size=None):
     return out
 
 
+def effective_n(conn, horizon_ms):
+    """
+    n bruto e n EFETIVO para estimativa de cauda.
+
+    Observações de tamanhos dentro do mesmo bloco são contíguas no tempo, e
+    volatilidade forma cluster — então elas não são independentes. A
+    autocorrelação de lag 1 de |drift|, na ordem de medição, dá o desconto:
+
+        n_eff = n × (1 − ρ) / (1 + ρ)
+
+    Com ρ > 0 o n efetivo é menor que o bruto, e é o efetivo que manda na
+    resolução de cauda.
+    """
+    vals = [
+        r[0]
+        for r in conn.execute(
+            "SELECT drift_bps FROM quote_drift "
+            "WHERE drift_bps IS NOT NULL AND nominal_horizon_ms = ? ORDER BY id",
+            (horizon_ms,),
+        )
+    ]
+    n = len(vals)
+    if n < 3:
+        return {"n": n, "rho": None, "n_eff": n}
+
+    mags = [abs(v) for v in vals]  # cluster de volatilidade aparece na magnitude
+    mean = sum(mags) / n
+    dev = [m - mean for m in mags]
+    denom = sum(d * d for d in dev)
+    if denom == 0:
+        return {"n": n, "rho": 0.0, "n_eff": n}
+
+    rho = sum(dev[i] * dev[i + 1] for i in range(n - 1)) / denom
+    rho = max(-0.99, min(0.99, rho))
+    n_eff = n * (1 - rho) / (1 + rho)
+    # Teto em n: rho negativo reduz variancia da media, mas nao cria
+    # amostra nova para estimar cauda. Nunca reportar n_eff > n.
+    return {"n": n, "rho": rho, "n_eff": max(1.0, min(float(n), n_eff))}
+
+
+def calibration_section(conn):
+    """
+    Calibração quote_drift vs sonda de notional desprezível.
+
+    A sonda é cotada em par com cada quote de tamanho real, a poucos ms de
+    distância. A diferença entre os dois drifts isola o componente
+    atribuível ao TAMANHO do que é movimento de preço puro.
+
+    É este o papel do polling: n pequeno basta para calibrar uma relação.
+    A cauda de drift adverso vem de histórico, no Day 2–3.
+    """
+    rows = list(
+        conn.execute(
+            """SELECT nominal_horizon_ms, position_size_usdc,
+                      drift_bps, mid_drift_bps, size_component_bps
+               FROM quote_drift
+               WHERE drift_bps IS NOT NULL AND mid_drift_bps IS NOT NULL
+               ORDER BY nominal_horizon_ms, position_size_usdc"""
+        )
+    )
+    print()
+    print("-" * 78)
+    print("  CALIBRACAO: quote_drift vs sonda de notional despresivel")
+    print("  (sonda cotada em par, a poucos ms — isola movimento de preco de tamanho)")
+    print("-" * 78)
+    if not rows:
+        print("  Sem pares sonda/tamanho nesta base.")
+        print("  Amostras anteriores a esta versao nao trazem a sonda — rode de novo.")
+        return {}
+
+    out = {}
+    print()
+    print(f"  {'HORIZ':>7} | {'TAM':>7} | {'n':>4} | {'|DRIFT|':>9} | {'|MID|':>9} | "
+          f"{'COMP. TAM':>10} | {'RAZAO':>7}")
+    print(f"  {'':>7} | {'US$':>7} | {'':>4} | {'bps med':>9} | {'bps med':>9} | "
+          f"{'bps med':>10} | {'d/mid':>7}")
+    print("  " + "-" * 68)
+    by_key = {}
+    for h, size, d, m, c in rows:
+        by_key.setdefault((h, size), []).append((d, m, c))
+
+    for (h, size), vals in sorted(by_key.items()):
+        dm = statistics.median([abs(v[0]) for v in vals])
+        mm = statistics.median([abs(v[1]) for v in vals])
+        cm = statistics.median([abs(v[2]) for v in vals if v[2] is not None])
+        ratio = (dm / mm) if mm else None
+        print(
+            f"  {str(h) + 'ms':>7} | {'$' + format(size, 'g'):>7} | {len(vals):>4} | "
+            f"{dm:>9.2f} | {mm:>9.2f} | {cm:>10.2f} | "
+            + (f"{ratio:>7.2f}" if ratio is not None else f"{'—':>7}")
+        )
+        out[f"{h}ms_{size}"] = {
+            "horizon_ms": h,
+            "position_usdc": size,
+            "n": len(vals),
+            "abs_drift_median_bps": dm,
+            "abs_mid_drift_median_bps": mm,
+            "abs_size_component_median_bps": cm,
+            "ratio_drift_over_mid": ratio,
+        }
+
+    print()
+    print("  Razao ~1 = o drift observado e movimento de preco, nao efeito de tamanho.")
+    print("  Razao crescente com o tamanho = liquidez rasa mexendo a quote alem do preco.")
+    return out
+
+
 def signed_percentiles(conn):
     """
     Distribuição SINALIZADA de drift por horizonte, para a camada de evolução.
@@ -326,7 +442,7 @@ def signed_percentiles(conn):
     }
 
 
-def revert_floor(conn, horizon_ms, tolerances_bps=SLIPPAGE_GRID_BPS):
+def revert_floor(conn, horizon_ms, tolerances_bps=SLIPPAGE_GRID_BPS, n_eff=None):
     """
     Piso de taxa de reversão, derivado da distribuição de drift medida.
 
@@ -359,7 +475,9 @@ def revert_floor(conn, horizon_ms, tolerances_bps=SLIPPAGE_GRID_BPS):
             continue
         adverse = sum(1 for v in vals if v < -tol)
         if adverse == 0:
-            p, upper = 1.0 / n, True  # teto de resolução da amostra, não zero
+            # Teto pelo n EFETIVO: com observacoes correlacionadas a cauda
+            # tem menos resolucao do que o n bruto sugere.
+            p, upper = 1.0 / (n_eff or n), True  # teto, nao zero
         else:
             p, upper = adverse / n, False
         out.append(
@@ -376,16 +494,16 @@ def revert_floor(conn, horizon_ms, tolerances_bps=SLIPPAGE_GRID_BPS):
 
 def curve_section(conn, summary, dstats):
     """
-    Entrega do Day 1: break-even em função da tolerância de slippage.
+    Curva PRELIMINAR de custo por tolerância de slippage.
 
-    Dois braços:
-      esquerdo (tol apertada) — reversão, MENSURÁVEL agora pelo drift
-      direito  (tol larga)    — sandwich, NÃO mensurável na Fase 1
+    Preliminar de propósito: o polling tem n pequeno e serve para calibrar a
+    relação quote_drift vs sonda, não para resolver cauda. O cálculo
+    definitivo de revert_rate_floor roda no Day 2–3 sobre histórico de trades,
+    que tem ordens de magnitude mais amostras. Nada aqui bloqueia o Day 1.
 
-    O braço esquerdo sozinho é monotonicamente decrescente e não tem mínimo.
-    O mínimo aparece quando se fecha o braço direito com o teto aritmético de
-    sandwich (um atacante extrai, no limite, toda a tolerância autorizada).
-    A curva real está entre os dois; a frequência de sandwich só sai da Fase 2.
+    Braço direito: resolvido por ECONOMIA DO ATACANTE, não por medição de
+    sandwich. Abaixo do piso econômico do MEV a curva é monotonicamente
+    decrescente e o que se reporta é a menor tolerância que zera reversão.
     """
     out = {}
     thesis = next(
@@ -398,35 +516,59 @@ def curve_section(conn, summary, dstats):
 
     det_usdc = thesis["total_sunk_median_usdc"]
     net_usdc = thesis["network_median_usdc"]
+    net_p90 = thesis["network_p90_usdc"]
     pos = thesis["position_usdc"]
     if det_usdc is None or net_usdc is None:
         print()
         print("  Custo determinístico incompleto — curva não desenhada.")
         return out
 
+    # Custo do atacante: duas transações (front + back) em nível de corrida.
+    # net_p90 é o total das DUAS pernas do nosso round trip, então uma tx
+    # de swap em nível p90 ≈ net_p90/2.
+    attacker_tx = (net_p90 / 2) if net_p90 else None
+    attacker_cost = (2 * attacker_tx) if attacker_tx else None
+
     for horizon in BREAK_EVEN_HORIZONS_MS:
-        floors = revert_floor(conn, horizon)
-        n = floors[0]["n"] if floors else 0
+        eff = effective_n(conn, horizon)
+        floors = revert_floor(conn, horizon, n_eff=eff["n_eff"])
+        n, n_eff, rho = eff["n"], eff["n_eff"], eff["rho"]
 
         print()
         print("=" * 78)
-        print(f"  CURVA DE BREAK-EVEN POR TOLERANCIA — POSICAO US${pos:g}, LATENCIA {horizon}ms")
+        print(f"  CURVA PRELIMINAR — POSICAO US${pos:g}, LATENCIA {horizon}ms")
         print("=" * 78)
+        print(f"  n bruto {n} | rho(lag1,|drift|) "
+              + (f"{rho:.3f}" if rho is not None else "n/d")
+              + f" | n EFETIVO {n_eff:.0f}")
+        print(f"  Resolucao de cauda pelo n efetivo: {100/n_eff:.2f}%")
+        print("  PRELIMINAR: revert_rate_floor definitivo sai no Day 2-3 sobre historico.")
 
         if n < MIN_DRIFT_SAMPLES:
             print()
-            print(f"  Amostras de drift neste horizonte: {n} (minimo {MIN_DRIFT_SAMPLES}).")
-            print("  A cauda da distribuicao nao tem resolucao — curva NAO desenhada.")
-            print("  Rode mais blocos: a taxa de reversao depende da cauda, nao do centro.")
+            print(f"  n abaixo de {MIN_DRIFT_SAMPLES} — curva nao desenhada.")
             continue
 
-        print(f"  n = {n} amostras de drift (pool entre tamanhos)")
-        print()
-        print(f"  {'TOL':>5} | {'P(REVERT)':>10} | {'GAS DESP.':>10} | {'BE SEM':>9} | "
-              f"{'SANDW MAX':>10} | {'BE COM':>9}")
-        print(f"  {'bps':>5} | {'por perna':>10} | {'US$':>10} | {'SANDW %':>9} | "
-              f"{'US$':>10} | {'SANDW %':>9}")
-        print("  " + "-" * 68)
+        # ── Piso economico do MEV ──
+        if attacker_cost:
+            print()
+            print("  PISO ECONOMICO DO MEV")
+            print("  " + "-" * 68)
+            print(f"    custo do atacante (2 tx, priority p90): ${attacker_cost:.6f}")
+            max_safe_tol = attacker_cost * 10_000 / pos
+            print(f"    TOLERANCIA MAXIMA que mantem US${pos:g} sob o piso: "
+                  f"{max_safe_tol:.0f} bps")
+            print(f"    Acima disso a extracao passa a cobrir o custo do atacante.")
+            print()
+            print(f"    {'TOL bps':>8} | {'EXTRACAO US$':>13} | {'LIMIAR POSICAO':>15} | {'US$' + format(pos, 'g'):>10}")
+            print("    " + "-" * 60)
+            for f in floors:
+                tol = f["tol_bps"]
+                extraction = pos * (tol / 10_000)
+                threshold = attacker_cost * 10_000 / tol
+                below = pos < threshold
+                print(f"    {tol:>8} | {extraction:>13.6f} | {threshold:>15.2f} | "
+                      f"{'SOB O PISO' if below else 'exposto':>10}")
 
         rows = []
         for f in floors:
@@ -434,60 +576,72 @@ def curve_section(conn, summary, dstats):
             if p is None or p >= 1:
                 continue
             wasted = net_usdc * (p / (1 - p))
-            cost_opt = det_usdc + wasted
-            sandwich = pos * (f["tol_bps"] / 10_000)
-            cost_pes = cost_opt + sandwich
-            row = {
+            cost = det_usdc + wasted
+            threshold = (attacker_cost * 10_000 / f["tol_bps"]) if attacker_cost else None
+            below_floor = threshold is not None and pos < threshold
+            sandwich = 0.0 if below_floor else pos * (f["tol_bps"] / 10_000)
+            rows.append({
                 "tol_bps": f["tol_bps"],
                 "p_leg": p,
                 "p_leg_is_upper_bound": f["upper_bound"],
                 "p_round_trip": f["p_round_trip"],
                 "wasted_gas_usdc": wasted,
-                "break_even_no_sandwich_pct": cost_opt / pos * 100,
-                "sandwich_upper_bound_usdc": sandwich,
-                "break_even_with_sandwich_pct": cost_pes / pos * 100,
-            }
-            rows.append(row)
-            mark = "<" if f["upper_bound"] else " "
-            print(
-                f"  {f['tol_bps']:>5} | {p * 100:>9.2f}%{mark} | {wasted:>10.6f} | "
-                f"{row['break_even_no_sandwich_pct']:>8.3f}% | {sandwich:>10.6f} | "
-                f"{row['break_even_with_sandwich_pct']:>8.3f}%"
-            )
+                "break_even_pct": cost / pos * 100,
+                "mev_threshold_position_usdc": threshold,
+                "position_below_mev_floor": below_floor,
+                "sandwich_applied_usdc": sandwich,
+                "break_even_with_sandwich_pct": (cost + sandwich) / pos * 100,
+            })
+
+        print()
+        print(f"  {'TOL':>5} | {'P(REVERT)':>10} | {'GAS DESP.':>10} | {'BE':>9} | {'MEV':>11}")
+        print(f"  {'bps':>5} | {'por perna':>10} | {'US$':>10} | {'%':>9} | {'':>11}")
+        print("  " + "-" * 58)
+        for r in rows:
+            mark = "<" if r["p_leg_is_upper_bound"] else " "
+            mev = "sob o piso" if r["position_below_mev_floor"] else "exposto"
+            print(f"  {r['tol_bps']:>5} | {r['p_leg']*100:>9.2f}%{mark} | "
+                  f"{r['wasted_gas_usdc']:>10.6f} | {r['break_even_pct']:>8.3f}% | {mev:>11}")
 
         if any(r["p_leg_is_upper_bound"] for r in rows):
             print()
-            print(f"  '<' = nenhuma amostra estourou essa tolerancia; p e TETO de 1/n,")
-            print(f"        nao zero. A amostra so nao resolve essa cauda.")
+            print(f"  '<' = nenhuma amostra estourou a tolerancia; p e TETO de 1/n_eff,")
+            print(f"        nao zero.")
 
-        if rows:
+        all_below = rows and all(r["position_below_mev_floor"] for r in rows)
+        if all_below:
+            zeroing = next((r for r in rows if r["p_leg_is_upper_bound"]), None)
+            print()
+            print(f"  US${pos:g} FICA SOB O PISO ECONOMICO DO MEV EM TODA A GRADE.")
+            print("  Sanduichar essa posicao nao cobre o custo de duas transacoes do")
+            print("  atacante mais a corrida de priority fee. O braco direito nao fecha,")
+            print("  a curva e MONOTONICAMENTE DECRESCENTE e nao existe minimo interno.")
+            print()
+            if zeroing:
+                print(f"  TOLERANCIA MINIMA QUE ZERA REVERSAO (ate a resolucao): "
+                      f"{zeroing['tol_bps']} bps -> {zeroing['break_even_pct']:.3f}%")
+            else:
+                print("  Nenhuma tolerancia da grade zerou reversao na amostra.")
+            print()
+            print("  Esta e uma VANTAGEM ESTRUTURAL da microposicao, nao um achado")
+            print("  de estrategia: o desenho opera abaixo do piso economico do MEV.")
+        elif rows:
             best = min(rows, key=lambda r: r["break_even_with_sandwich_pct"])
-            n_upper = sum(1 for r in rows if r["p_leg_is_upper_bound"])
-            if n_upper > len(rows) / 2:
-                print()
-                print("  " + "!" * 68)
-                print(f"  BRACO ESQUERDO SUB-RESOLVIDO: {n_upper} de {len(rows)} tolerancias")
-                print(f"  caem abaixo da resolucao da amostra (1/{n} = {100/n:.2f}%).")
-                print("  A curva fica artificialmente plana a direita e o MINIMO ABAIXO")
-                print("  NAO E CONFIAVEL — ele so reflete onde a amostra parou de ver cauda.")
-                print("  Para resolver reversao de 0.1% sao necessarias ~1000 amostras.")
-                print("  " + "!" * 68)
             print()
-            print(f"  MINIMO DA CURVA COM SANDWICH: {best['tol_bps']} bps  ->  "
-                  f"{best['break_even_with_sandwich_pct']:.3f}%")
-            print(f"    reversao por perna {best['p_leg']*100:.2f}%, "
-                  f"round trip {best['p_round_trip']*100:.2f}%")
-            print()
-            print("  LEITURA: o braco esquerdo (reversao) e MEDIDO; o direito (sandwich)")
-            print("  e o teto aritmetico, nao medicao. O minimo acima e onde a curva")
-            print("  para sob a hipotese de que TODO trade e sanduichado ate o limite.")
-            print("  Em posicao de US$1 a extracao pode nao compensar o gas do atacante,")
-            print("  o que empurraria o minimo para a direita — isso e hipotese a testar")
-            print("  na Fase 2, nao resultado deste Day 1.")
-            out[f"{horizon}ms"] = {"rows": rows, "min_with_sandwich": best, "samples": n}
+            print(f"  MINIMO: {best['tol_bps']} bps -> {best['break_even_with_sandwich_pct']:.3f}%")
+
+        out[f"{horizon}ms"] = {
+            "rows": rows,
+            "n_raw": n,
+            "n_effective": n_eff,
+            "rho_lag1": rho,
+            "attacker_cost_usdc": attacker_cost,
+            "max_safe_tolerance_bps": (attacker_cost * 10_000 / pos) if attacker_cost else None,
+            "all_below_mev_floor": bool(all_below),
+            "preliminary": True,
+        }
 
     return out
-
 
 def parse_ts(s):
     try:
@@ -755,7 +909,10 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
         print("  condicional a direcao do sinal e vive na camada de evolucao.")
         print("  O que e global e mensuravel aqui e a REVERSAO — tabela abaixo.")
 
-    # ── A entrega do Day 1: curva de custo por tolerancia ──
+    # ── Papel do polling: calibrar a relacao, nao resolver cauda ──
+    calib_out = calibration_section(conn)
+
+    # ── Curva PRELIMINAR; definitiva sai no Day 2-3 sobre historico ──
     curve_out = curve_section(conn, summary, dstats)
 
     # ── Leitura direta ──
@@ -859,10 +1016,16 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
                 },
                 "quoted_drift_signed_percentiles": signed_percentiles(conn),
                 # Piso de reversão vindo do drift. NÃO é txFailureRate.
-                "revert_rate_floor_by_slippage_bps": {
-                    f"{h}ms": revert_floor(conn, h) for h in BREAK_EVEN_HORIZONS_MS
+                # PRELIMINAR: definitivo sai no Day 2-3 sobre histórico de trades.
+                "revert_rate_floor_by_slippage_bps_PRELIMINARY": {
+                    f"{h}ms": revert_floor(conn, h, n_eff=effective_n(conn, h)["n_eff"])
+                    for h in BREAK_EVEN_HORIZONS_MS
                 },
-                "break_even_curve": curve_out,
+                "effective_n_by_horizon": {
+                    f"{h}ms": effective_n(conn, h) for h in BREAK_EVEN_HORIZONS_MS
+                },
+                "quote_drift_vs_mid_calibration": calib_out,
+                "break_even_curve_PRELIMINARY": curve_out,
             },
             indent=2,
         ),
