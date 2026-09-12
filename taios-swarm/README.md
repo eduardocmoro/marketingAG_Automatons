@@ -288,10 +288,35 @@ feeMint == inputMint  →  tier = feeAmount / inAmount
 feeMint == outputMint →  tier = feeAmount / outAmount
 ```
 
-O relatório imprime o tier por (tamanho, perna, salto, venue). Se micro-ordens
-estiverem indo para CLMM de 1–5 bps em vez de Raydium 25 bps, a premissa
-herdada está **errada para cima** e o desenho de US$1 fica mais viável do que
-supúnhamos — medido, não suposto.
+O relatório imprime o tier por (tamanho, perna, salto, venue).
+
+**Mas tier baixo não salva o desenho de US$1.** Taxa de pool é percentual;
+custo de rede é **fixo em dólar**. Em posição pequena o fixo domina:
+
+| | US$0,50 | US$1 | US$5 | US$50 |
+|---|---|---|---|---|
+| rede (fixa ~US$0,001) | 0,21% | 0,10% | 0,021% | 0,002% |
+| pool a 1 bps (round trip) | 0,02% | 0,02% | 0,02% | 0,02% |
+
+Descobrir tier baixo reduz o componente que **já era menor**. O relatório
+decompõe break-even em fixo vs percentual por tamanho e calcula o
+**cruzamento**:
+
+```
+cruzamento = rede_usd × 100 / pool_pct
+```
+
+Esse ponto é o **tamanho mínimo economicamente racional** — abaixo dele o custo
+é dominado por uma taxa que não diminui por mais que a ordem encolha. E tier
+**menor** empurra o cruzamento para **cima**: com pool barato é preciso posição
+maior antes que o pool passe a importar.
+
+#### Ressalva: tier de CLMM vale para o tamanho medido
+
+Pool de 1–5 bps é **liquidez concentrada em faixa estreita**. Fora da faixa o
+impacto de preço sobe rápido. Irrelevante em US$1; relevante se o enxame
+escalar notional. **O tier observado é válido para o tamanho medido e não é
+extrapolável para volume maior** — reescalar exige remedir.
 
 ### Integridade antes de leitura
 

@@ -399,7 +399,11 @@ async function measurePriorityFeeDistribution(poolAccounts = []) {
     out.global = {
       samples: fees.length,
       median: percentile(fees, 0.5),
+      p25: percentile(fees, 0.25),
+      p50: percentile(fees, 0.5),
+      p75: percentile(fees, 0.75),
       p90: percentile(fees, 0.9),
+      p99: percentile(fees, 0.99),
       min: fees[0] ?? null,
       max: fees[fees.length - 1] ?? null,
     };
@@ -417,10 +421,17 @@ async function measurePriorityFeeDistribution(poolAccounts = []) {
   try {
     const scoped = await rpc("getRecentPrioritizationFees", [poolAccounts.slice(0, 128)]);
     const fees = scoped.map((f) => f.prioritizationFee).sort((a, b) => a - b);
+    // Dispersao importa mais que o centro: se a cauda persistir DEPOIS do
+    // filtro por ammKey, o custo em US$1 varia de forma imprevisivel e
+    // nenhum alvo fixo de lucro por trade se sustenta.
     out.solUsdc = {
       samples: fees.length,
       median: percentile(fees, 0.5),
+      p25: percentile(fees, 0.25),
+      p50: percentile(fees, 0.5),
+      p75: percentile(fees, 0.75),
       p90: percentile(fees, 0.9),
+      p99: percentile(fees, 0.99),
       min: fees[0] ?? null,
       max: fees[fees.length - 1] ?? null,
     };

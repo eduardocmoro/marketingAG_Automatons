@@ -60,7 +60,10 @@ CREATE TABLE IF NOT EXISTS run (
     sol_usdc_price      REAL,
     base_fee_per_sig    INTEGER,
     cu_price_median     REAL,
+    cu_price_p25        REAL,
+    cu_price_p75        REAL,
     cu_price_p90        REAL,
+    cu_price_p99        REAL,
     cu_price_samples    INTEGER,
     ata_rent_lamports   INTEGER,
     UNIQUE(timestamp_utc)
@@ -91,6 +94,10 @@ CREATE TABLE IF NOT EXISTS round_trip (
     fee_routeplan_usdc      REAL,   -- soma de feeAmount das duas pernas
     fee_routeplan_pct       REAL,
     fee_discrepancy_usdc    REAL,   -- observado - routePlan
+    leg1_cu_consumed        INTEGER,
+    leg2_cu_consumed        INTEGER,
+    leg1_signatures         INTEGER,
+    leg2_signatures         INTEGER,
     leg1_route_sig          TEXT,   -- pools+split concretos da perna 1
     leg2_route_sig          TEXT,
     error                   TEXT
@@ -172,6 +179,13 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
         ("run", "rent_formula_lamports", "INTEGER"),
         ("run", "cu_price_global_median", "REAL"),
         ("run", "cu_price_global_p90", "REAL"),
+        ("run", "cu_price_p25", "REAL"),
+        ("run", "cu_price_p75", "REAL"),
+        ("run", "cu_price_p99", "REAL"),
+        ("round_trip", "leg1_cu_consumed", "INTEGER"),
+        ("round_trip", "leg2_cu_consumed", "INTEGER"),
+        ("round_trip", "leg1_signatures", "INTEGER"),
+        ("round_trip", "leg2_signatures", "INTEGER"),
         ("quote_drift", "route_match", "INTEGER"),
         ("quote_drift", "size_route", "TEXT"),
         ("quote_drift", "probe_route", "TEXT"),
@@ -208,8 +222,8 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                     cu_price_samples, ata_rent_lamports,
                     complete, rate_limit_hits, rent_matches_formula,
                     rent_formula_lamports, cu_price_global_median,
-                    cu_price_global_p90)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    cu_price_global_p90, cu_price_p25, cu_price_p75, cu_price_p99)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     rec.get("timestampUtc"),
                     rec.get("rpcUrl"),
@@ -226,6 +240,9 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                     (rec.get("ataRent") or {}).get("formulaLamports"),
                     ((rec.get("priorityFee") or {}).get("global") or {}).get("median"),
                     ((rec.get("priorityFee") or {}).get("global") or {}).get("p90"),
+                    scoped.get("p25"),
+                    scoped.get("p75"),
+                    scoped.get("p99"),
                 ),
             )
             if cur.rowcount == 0:
@@ -262,8 +279,10 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                         cu_consumed_source, tx_failure_rate,
                         round_trip_return_pct, leg_gap_ms,
                         fee_routeplan_usdc, fee_routeplan_pct,
-                        fee_discrepancy_usdc, leg1_route_sig, leg2_route_sig, error)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        fee_discrepancy_usdc, leg1_route_sig, leg2_route_sig,
+                        leg1_cu_consumed, leg2_cu_consumed,
+                        leg1_signatures, leg2_signatures, error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         run_id,
                         rt.get("positionSizeUsdc"),
@@ -290,6 +309,10 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                         (rt.get("feeCrossCheck") or {}).get("discrepancyUsdc"),
                         (leg1.get("route") or {}).get("signature"),
                         (leg2.get("route") or {}).get("signature"),
+                        (leg1.get("compute") or {}).get("cuConsumed"),
+                        (leg2.get("compute") or {}).get("cuConsumed"),
+                        (leg1.get("compute") or {}).get("signatures"),
+                        (leg2.get("compute") or {}).get("signatures"),
                         rt.get("error"),
                     ),
                 )
@@ -613,6 +636,153 @@ def integrity_section(conn):
     return {**verdicts, "route_groups": len(groups), "pool_fee_by_size": fee_table}
 
 
+def decomposition_section(conn, sol_price):
+    """
+    Custo de rede é FIXO em dólar; taxa de pool é PERCENTUAL.
+
+    Logo, como % da posição, a rede CRESCE quando a posição encolhe e o pool
+    fica constante. Descobrir tier baixo reduz o componente que já era menor
+    em posição pequena — não salva o desenho.
+
+    O cruzamento entre as duas curvas é o TAMANHO MÍNIMO ECONOMICAMENTE
+    RACIONAL: abaixo dele o custo é dominado por uma taxa que não diminui
+    por mais que a ordem encolha.
+
+        rede_pct(tam) = rede_usd / tam × 100
+        pool_pct      = constante
+        cruzamento    = rede_usd × 100 / pool_pct
+    """
+    rows = conn.execute(
+        "SELECT position_size_usdc, AVG(net_lamports_median), AVG(fee_routeplan_pct), COUNT(*) "
+        "FROM round_trip WHERE error IS NULL AND net_lamports_median IS NOT NULL "
+        "GROUP BY position_size_usdc ORDER BY position_size_usdc"
+    ).fetchall()
+    print()
+    print("=" * 78)
+    print("  DECOMPOSICAO: REDE (FIXA) vs POOL (PERCENTUAL)")
+    print("=" * 78)
+    if not rows or sol_price is None:
+        print("  sem dados suficientes")
+        return {}
+
+    print()
+    print(f"  {'TAMANHO':>9} | {'REDE US$':>10} | {'REDE %':>9} | {'POOL %':>9} | {'DOMINANTE':>12}")
+    print("  " + "-" * 66)
+    out = []
+    net_usds, pool_pcts = [], []
+    for size, net_lamports, pool_pct, n in rows:
+        net_usd = net_lamports / LAMPORTS_PER_SOL * sol_price
+        net_pct = net_usd / size * 100
+        net_usds.append(net_usd)
+        if pool_pct is not None:
+            pool_pcts.append(pool_pct)
+        if pool_pct is None:
+            dom, pool_s = "—", "—"
+        else:
+            ratio = net_pct / pool_pct if pool_pct > 0 else float("inf")
+            dom = f"rede {ratio:.1f}x" if ratio >= 1 else f"pool {1/ratio:.1f}x"
+            pool_s = f"{pool_pct:.4f}"
+        print(f"  {'$' + format(size, 'g'):>9} | {net_usd:>10.6f} | {net_pct:>8.4f}% | "
+              f"{pool_s:>9} | {dom:>12}")
+        out.append({"position_usdc": size, "network_usd": net_usd,
+                    "network_pct": net_pct, "pool_pct": pool_pct})
+
+    # ── Cruzamento ──
+    if net_usds and pool_pcts:
+        net_ref = statistics.median(net_usds)
+        print()
+        print("  CRUZAMENTO — tamanho minimo economicamente racional")
+        print("  " + "-" * 66)
+        print(f"    rede de referencia: ${net_ref:.6f} por round trip (mediana entre tamanhos)")
+        print()
+        print(f"    {'TIER POOL':>12} | {'CRUZAMENTO':>12} | interpretacao")
+        print("    " + "-" * 60)
+        for pool_pct in sorted(set(round(x, 4) for x in pool_pcts)):
+            if pool_pct <= 0:
+                continue
+            cross = net_ref * 100 / pool_pct
+            print(f"    {pool_pct:>11.4f}% | {'$' + format(round(cross, 2), 'g'):>12} | "
+                  f"abaixo disso a REDE domina")
+        print()
+        print("    Tier MENOR empurra o cruzamento para CIMA: com pool barato e preciso")
+        print("    uma posicao MAIOR antes que a taxa de pool passe a importar.")
+        print("    Em posicao pequena o gargalo e a taxa fixa de rede, nao o pool.")
+        out_cross = {str(round(pp, 4)): net_ref * 100 / pp
+                     for pp in set(pool_pcts) if pp > 0}
+    else:
+        out_cross = {}
+    return {"by_size": out, "crossover_usdc_by_pool_pct": out_cross}
+
+
+def dispersion_section(conn, sol_price):
+    """
+    Dispersão da priority fee FILTRADA por pool.
+
+    Mais decisivo que o tier: se a cauda persistir depois do filtro por
+    ammKey, o custo em US$1 varia de forma imprevisível e nenhum alvo fixo
+    de lucro por trade se sustenta.
+    """
+    print()
+    print("=" * 78)
+    print("  DISPERSAO DA PRIORITY FEE FILTRADA POR POOL")
+    print("=" * 78)
+    row = conn.execute(
+        "SELECT cu_price_p25, cu_price_median, cu_price_p75, cu_price_p90, cu_price_p99, "
+        "       cu_price_global_median, cu_price_global_p90 "
+        "FROM run WHERE cu_price_median IS NOT NULL ORDER BY run_id DESC LIMIT 1"
+    ).fetchone()
+    cu = conn.execute(
+        "SELECT AVG(leg1_cu_consumed + leg2_cu_consumed), AVG(leg1_signatures + leg2_signatures) "
+        "FROM round_trip WHERE leg1_cu_consumed IS NOT NULL"
+    ).fetchone()
+    if not row or row[1] is None:
+        print("  sem dados de priority fee filtrada")
+        return {}
+    p25, p50, p75, p90, p99, gmed, gp90 = row
+    cu_total, sigs_total = (cu or (None, None))
+
+    if p50 and p50 > 0 and p99:
+        spread = p99 / p50
+        print()
+        print(f"  filtrada por pool: p25 {p25} | p50 {p50} | p75 {p75} | p90 {p90} | p99 {p99}")
+        if gmed and gmed > 0 and gp90:
+            print(f"  global (referencia): mediana {gmed} | p90 {gp90} "
+                  f"(spread {gp90/gmed:.0f}x)")
+        print(f"  SPREAD p99/p50 DEPOIS DO FILTRO: {spread:.1f}x")
+
+    if cu_total is None or sigs_total is None or sol_price is None:
+        print()
+        print("  Sem cu_consumed/assinaturas para converter em break-even por percentil.")
+        return {"p50": p50, "p99": p99}
+
+    print()
+    print(f"  Break-even em US${THESIS_POSITION_USDC:g}, so componente de rede,")
+    print(f"  com cu={cu_total:.0f} e {sigs_total:.0f} assinaturas nas duas pernas:")
+    print()
+    print(f"    {'PERCENTIL':>10} | {'cu_price':>10} | {'REDE US$':>10} | {'% DA POSICAO':>13}")
+    print("    " + "-" * 54)
+    out = {}
+    for name, val in [("p25", p25), ("p50", p50), ("p75", p75), ("p90", p90), ("p99", p99)]:
+        if val is None:
+            continue
+        lamports = 5000 * sigs_total + (val * cu_total) / 1_000_000
+        usd = lamports / LAMPORTS_PER_SOL * sol_price
+        pct = usd / THESIS_POSITION_USDC * 100
+        print(f"    {name:>10} | {val:>10.0f} | {usd:>10.6f} | {pct:>12.4f}%")
+        out[name] = {"cu_price": val, "network_usd": usd, "network_pct": pct}
+
+    if "p50" in out and "p99" in out and out["p50"]["network_pct"] > 0:
+        var = out["p99"]["network_pct"] / out["p50"]["network_pct"]
+        print()
+        print(f"  Custo de rede em US$1 varia {var:.1f}x entre p50 e p99.")
+        if var >= 3:
+            print("  [!] Variacao dessa ordem inviabiliza alvo FIXO de lucro por trade.")
+            print("      O alvo tem que ser condicional a priority fee no momento da")
+            print("      decisao, ou o agente precisa recusar trade quando a fee estiver")
+            print("      na cauda. Isso e parametro de desenho, nao detalhe.")
+    return out
+
+
 def drift_stats(conn, size=None):
     """
     |drift| por horizonte de latência.
@@ -854,7 +1024,8 @@ def revert_floor(conn, horizon_ms, tolerances_bps=SLIPPAGE_GRID_BPS, n_eff=None)
         if adverse == 0:
             # Teto pelo n EFETIVO: com observacoes correlacionadas a cauda
             # tem menos resolucao do que o n bruto sugere.
-            p, upper = 1.0 / (n_eff or n), True  # teto, nao zero
+            denom = n_eff if (n_eff and n_eff > 0) else n
+            p, upper = 1.0 / denom, True  # teto, nao zero
         else:
             p, upper = adverse / n, False
         out.append(
@@ -918,8 +1089,14 @@ def curve_section(conn, summary, dstats):
         print(f"  n bruto {n} | rho(lag1,|drift|) "
               + (f"{rho:.3f}" if rho is not None else "n/d")
               + f" | n EFETIVO {n_eff:.0f}")
-        print(f"  Resolucao de cauda pelo n efetivo: {100/n_eff:.2f}%")
+        if n_eff > 0:
+            print(f"  Resolucao de cauda pelo n efetivo: {100/n_eff:.2f}%")
         print("  PRELIMINAR: revert_rate_floor definitivo sai no Day 2-3 sobre historico.")
+
+        if n == 0:
+            print()
+            print("  Sem amostras de drift neste horizonte — curva nao desenhada.")
+            continue
 
         if n < MIN_DRIFT_SAMPLES:
             print()
@@ -1294,6 +1471,9 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
         print("  condicional a direcao do sinal e vive na camada de evolucao.")
         print("  O que e global e mensuravel aqui e a REVERSAO — tabela abaixo.")
 
+    decomp = decomposition_section(conn, sol_price)
+    dispersion = dispersion_section(conn, sol_price)
+
     # ── Papel do polling: calibrar a relacao, nao resolver cauda ──
     calib_out = calibration_section(conn)
 
@@ -1387,6 +1567,8 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
                 "summary": summary,
                 "sol_usdc_price_measured": sol_price,
                 "integrity": integrity,
+                "decomposition": decomp,
+                "priority_fee_dispersion": dispersion,
                 "coverage": {
                     "windows": len(cov["windows"]),
                     "span_hours": cov["span_hours"],
