@@ -16,10 +16,10 @@ Só usa stdlib. Sem dependências.
 
 import argparse
 import json
-import os
 import sqlite3
 import statistics
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,6 +27,15 @@ DEFAULT_JSONL = ROOT / "measurements" / "day1_costs.jsonl"
 DEFAULT_DB = ROOT / "measurements" / "day1.sqlite"
 
 LAMPORTS_PER_SOL = 1_000_000_000
+
+# Mints distintos que o enxame negocia. Sob ADR-001 (carteira única) é
+# também o número total de ATAs do projeto inteiro — uma vez, para sempre.
+DEFAULT_CORE_MINTS = 5
+
+# Emenda: cobertura mínima para a distribuição de congestionamento fazer sentido.
+MIN_WINDOWS = 3
+MIN_SPAN_HOURS = 24
+WINDOW_GAP_HOURS = 1  # intervalo que separa duas janelas distintas
 
 
 # ── Ingestão: JSONL -> SQLite ────────────────────────────────────────
@@ -190,7 +199,47 @@ def fmt(v, nd=4, dash="—"):
     return dash if v is None else f"{v:.{nd}f}"
 
 
-def report(conn: sqlite3.Connection) -> None:
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def coverage(conn):
+    """
+    Agrupa as execuções em janelas (intervalo > WINDOW_GAP_HOURS separa janelas).
+
+    Uma hora corrida de amostras é UM regime de congestionamento, não uma
+    distribuição. Sem janelas espalhadas, mediana e p90 descrevem aquela hora
+    e nada além dela.
+    """
+    stamps = [
+        parse_ts(r[0])
+        for r in conn.execute("SELECT timestamp_utc FROM run ORDER BY timestamp_utc")
+    ]
+    stamps = [s for s in stamps if s is not None]
+    if not stamps:
+        return {"windows": [], "span_hours": 0.0, "hours_of_day": set(), "sufficient": False}
+
+    windows = [[stamps[0]]]
+    for ts in stamps[1:]:
+        if (ts - windows[-1][-1]) > timedelta(hours=WINDOW_GAP_HOURS):
+            windows.append([ts])
+        else:
+            windows[-1].append(ts)
+
+    span_hours = (stamps[-1] - stamps[0]).total_seconds() / 3600
+    return {
+        "windows": windows,
+        "span_hours": span_hours,
+        "hours_of_day": {s.hour for s in stamps},
+        "sufficient": len(windows) >= MIN_WINDOWS and span_hours >= MIN_SPAN_HOURS,
+    }
+
+
+def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
+           out_dir: Path = ROOT / "measurements") -> None:
     runs = conn.execute(
         "SELECT COUNT(*), MIN(timestamp_utc), MAX(timestamp_utc) FROM run"
     ).fetchone()
@@ -235,9 +284,26 @@ def report(conn: sqlite3.Connection) -> None:
     if rents and sol_price:
         rent_sol = statistics.median(rents) / LAMPORTS_PER_SOL
         print(
-            f"  Rent de ATA    : {statistics.median(rents):,.0f} lamports = "
-            f"{rent_sol:.9f} SOL = ${rent_sol * sol_price:.4f} (RECUPERÁVEL)"
+            f"  Rent por ATA   : {statistics.median(rents):,.0f} lamports = "
+            f"{rent_sol:.9f} SOL = ${rent_sol * sol_price:.4f}"
         )
+
+    # ── Cobertura temporal ──
+    cov = coverage(conn)
+    n_win = len(cov["windows"])
+    print(
+        f"  Cobertura      : {n_win} janela(s), {cov['span_hours']:.1f}h de span, "
+        f"horas UTC {sorted(cov['hours_of_day'])}"
+    )
+    if not cov["sufficient"]:
+        print()
+        print("  " + "!" * 72)
+        print(f"  ATENCAO: cobertura insuficiente ({n_win} janela(s), {cov['span_hours']:.1f}h).")
+        print(f"  Minimo para estimar congestionamento: {MIN_WINDOWS} janelas em "
+              f">= {MIN_SPAN_HOURS}h.")
+        print("  Mediana e p90 abaixo descrevem as janelas medidas, nao o regime geral.")
+        print("  Rode mais blocos em horarios distintos antes de decidir qualquer coisa.")
+        print("  " + "!" * 72)
 
     # ── Tabela principal ──
     print()
@@ -346,18 +412,30 @@ def report(conn: sqlite3.Connection) -> None:
         if one["break_even_move_p90_pct"] is not None:
             print(f"      p90     : {one['break_even_move_p90_pct']:.3f}%")
         print()
-        if rents and sol_price:
-            rent_usd = statistics.median(rents) / LAMPORTS_PER_SOL * sol_price
-            print(
-                f"    Rent de ATA travado numa posição de US$1: ${rent_usd:.4f} "
-                f"({rent_usd / 1.0 * 100:.1f}% da posição)"
-            )
-            print("      -> capital travado recuperável, NÃO custo afundado, mas")
-            print("         imobiliza capital enquanto a posição existe.")
+        print("    O rent de ATA NAO entra nesta conta. Ver bloco de setup abaixo.")
     else:
         print("  Sem amostra válida de US$1,00. Rode a medição com esse tamanho.")
     print()
     print("=" * 78)
+
+    # ── Setup de portfólio: uma vez, não por trade (ADR-001 §3) ──
+    if rents and sol_price:
+        rent_lamports = statistics.median(rents)
+        rent_usd = rent_lamports / LAMPORTS_PER_SOL * sol_price
+        total_usd = rent_usd * core_mints
+        print()
+        print("  SETUP DE PORTFOLIO — UMA VEZ, NAO POR TRADE")
+        print("  " + "-" * 74)
+        print(f"    ATA e criada uma vez por (carteira, mint) e reusada por todos os")
+        print(f"    trades seguintes, de todos os agentes. Sob ADR-001 o enxame inteiro")
+        print(f"    usa UMA carteira, entao sao {core_mints} ATAs no total, para sempre.")
+        print()
+        print(f"    rent por ATA          : ${rent_usd:.4f}  (SOL medido a ${sol_price:.2f})")
+        print(f"    {core_mints} mints do nucleo     : ${total_usd:.4f} travados, UMA vez")
+        print(f"    custo por trade       : $0.0000 — nao escala com numero de trades")
+        print()
+        print("    O rent e CAPITAL TRAVADO RECUPERAVEL: volta integralmente ao fechar")
+        print("    a conta. Nao e custo afundado e nao entra no break-even por trade.")
 
     # ── Rotas observadas ──
     print()
@@ -385,8 +463,24 @@ def report(conn: sqlite3.Connection) -> None:
         print(f"  [ALERTA] {leaked} amostra(s) com realized_slippage preenchido na Fase 1.")
         print("           Isso não deveria acontecer fora da execução real.")
 
-    out = ROOT / "measurements" / "day1_summary.json"
-    out.write_text(json.dumps({"summary": summary, "sol_usdc_price": sol_price}, indent=2), "utf-8")
+    # Ao lado do .sqlite usado, para que um fixture nunca escreva em measurements/.
+    out = out_dir / "day1_summary.json"
+    out.write_text(
+        json.dumps(
+            {
+                "summary": summary,
+                "sol_usdc_price_measured": sol_price,
+                "coverage": {
+                    "windows": len(cov["windows"]),
+                    "span_hours": cov["span_hours"],
+                    "hours_of_day_utc": sorted(cov["hours_of_day"]),
+                    "sufficient": cov["sufficient"],
+                },
+            },
+            indent=2,
+        ),
+        "utf-8",
+    )
     print(f"\n  Resumo em JSON: {out}")
 
 
@@ -394,10 +488,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jsonl", type=Path, default=DEFAULT_JSONL)
     ap.add_argument("--db", type=Path, default=DEFAULT_DB)
+    ap.add_argument(
+        "--mints",
+        type=int,
+        default=DEFAULT_CORE_MINTS,
+        help="mints distintos negociados = total de ATAs sob ADR-001 (carteira única)",
+    )
     args = ap.parse_args()
 
     conn = ingest(args.jsonl, args.db)
-    report(conn)
+    report(conn, core_mints=args.mints, out_dir=args.db.resolve().parent)
     conn.close()
 
 

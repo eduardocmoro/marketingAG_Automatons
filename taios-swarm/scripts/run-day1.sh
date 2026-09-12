@@ -4,10 +4,19 @@
 #
 # Uso:
 #   bash scripts/run-day1.sh              # 1 amostra
-#   bash scripts/run-day1.sh 12 300       # 12 amostras, 300s entre elas (1 hora)
+#   bash scripts/run-day1.sh 8 300        # 1 bloco: 8 amostras a cada 5 min
 #
-# Emenda 6: o arquivo é append-only. Rode ao longo de dias e horários
-# diferentes — um retrato único não serve para estimar distribuição.
+# IMPORTANTE — um bloco NÃO é suficiente.
+# 8 amostras seguidas cobrem ~40 min: um único regime de congestionamento.
+# São necessários no mínimo 3 blocos em horários distintos ao longo de 2 dias,
+# acumulando no MESMO jsonl (o arquivo é append-only). O relatório avisa
+# enquanto a cobertura for insuficiente e não deve ser usado para decidir
+# nada antes disso.
+#
+# Sugestão de agenda (horários UTC bem separados):
+#   dia 1, manhã   : bash scripts/run-day1.sh 8 300
+#   dia 1, noite   : bash scripts/run-day1.sh 8 300
+#   dia 2, tarde   : bash scripts/run-day1.sh 8 300
 #
 # Env opcionais:
 #   SOLANA_RPC_URL   RPC dedicado (Helius/QuickNode/Alchemy). O público

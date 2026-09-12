@@ -83,21 +83,30 @@ export interface LegCost {
 }
 
 /**
- * Rent de ATA (emenda 3).
- * O rent em si é CAPITAL TRAVADO RECUPERÁVEL — volta ao fechar a conta.
- * As taxas de tx para criar e fechar são CUSTO AFUNDADO.
- * Nunca some os dois na mesma linha.
+ * Custo de setup do portfólio — UMA VEZ, nunca por trade.
+ *
+ * Uma ATA é criada uma vez por (carteira, mint) e reusada por todos os trades
+ * seguintes, de todos os agentes. Sob ADR-001 (carteira única), são `mints`
+ * ATAs no total para o enxame inteiro, para sempre.
+ *
+ * O rent é CAPITAL TRAVADO RECUPERÁVEL — volta integralmente ao fechar a conta.
+ * Só a taxa de tx de criação é afundada, e amortizada sobre todos os trades
+ * futuros ela tende a zero.
+ *
+ * Nada disto entra no break-even por trade. Ver ADR-001 §3.
  */
-export interface AtaRentCost {
-  lamportsPerAccount: number;
-  /** true — o rent retorna integralmente no close. */
-  recoverable: true;
-  /** Afundado: taxa da tx que cria a conta. */
+export interface PortfolioSetupCost {
+  /** Quantos mints distintos o enxame negocia. */
+  mints: number;
+  rentLamportsPerAta: number;
+  /** mints × rentLamportsPerAta. Travado, recuperável. */
+  totalRentLamports: number;
+  totalRentUsdc: number | null;
+  /** Afundado, uma vez por ATA. */
   createTxFeeLamports: number | null;
-  /** Afundado: taxa da tx que fecha a conta. */
-  closeTxFeeLamports: number | null;
-  /** Quantas ATAs novas esta estratégia exige (0 se já existem). */
-  newAccountsRequired: number;
+  createTxFeeUsdc: number | null;
+  /** true — o rent retorna integralmente no close. */
+  rentRecoverable: true;
 }
 
 /**
@@ -124,12 +133,11 @@ export interface RoundTripCost {
   /** Soma das taxas de rede das duas pernas, convertida a USDC. */
   networkCostUsdc: number | null;
 
-  /** Capital travado, NÃO afundado. Reportado separado. */
-  ataRentLockedUsdc: number | null;
-  /** Taxas de tx de criação/fechamento de ATA. Afundado. */
-  ataTxCostUsdc: number | null;
-
-  /** swapLoss + networkCost + ataTxCost. Exclui rent recuperável. */
+  /**
+   * swapLoss + networkCost. Só isto.
+   * Rent de ATA NÃO entra aqui: é setup de portfólio, uma vez por mint,
+   * recuperável, e não escala com o número de trades (ADR-001 §3).
+   */
   totalSunkCostUsdc: number | null;
   totalSunkCostPct: number | null;
 
@@ -176,9 +184,9 @@ export function consolidate(params: {
   legs: [LegCost, LegCost];
   startUsdc: number;
   endUsdc: number;
-  ataRent: AtaRentCost | null;
 }): RoundTripCost {
-  const { phase, timestampUtc, positionSizeUsdc, solUsdcQuotedPrice, legs, startUsdc, endUsdc, ataRent } = params;
+  const { phase, timestampUtc, positionSizeUsdc, solUsdcQuotedPrice, legs, startUsdc, endUsdc } =
+    params;
 
   const swapLossUsdc = startUsdc - endUsdc;
   const swapLossPct = (swapLossUsdc / startUsdc) * 100;
@@ -193,19 +201,7 @@ export function consolidate(params: {
       ? lamportsToUsdc(netLamports, solUsdcQuotedPrice)
       : null;
 
-  let ataRentLockedUsdc: number | null = null;
-  let ataTxCostUsdc: number | null = null;
-  if (ataRent && solUsdcQuotedPrice != null) {
-    ataRentLockedUsdc = lamportsToUsdc(
-      ataRent.lamportsPerAccount * ataRent.newAccountsRequired,
-      solUsdcQuotedPrice
-    );
-    const txLamports = (ataRent.createTxFeeLamports ?? 0) + (ataRent.closeTxFeeLamports ?? 0);
-    ataTxCostUsdc = lamportsToUsdc(txLamports * ataRent.newAccountsRequired, solUsdcQuotedPrice);
-  }
-
-  const totalSunkCostUsdc =
-    networkCostUsdc != null ? swapLossUsdc + networkCostUsdc + (ataTxCostUsdc ?? 0) : null;
+  const totalSunkCostUsdc = networkCostUsdc != null ? swapLossUsdc + networkCostUsdc : null;
 
   const totalSunkCostPct =
     totalSunkCostUsdc != null ? (totalSunkCostUsdc / positionSizeUsdc) * 100 : null;
@@ -221,11 +217,36 @@ export function consolidate(params: {
     swapLossUsdc,
     swapLossPct,
     networkCostUsdc,
-    ataRentLockedUsdc,
-    ataTxCostUsdc,
     totalSunkCostUsdc,
     totalSunkCostPct,
     breakEvenMovePct: totalSunkCostPct,
+  };
+}
+
+/**
+ * Custo de setup do enxame inteiro (ADR-001: carteira única).
+ * Usa o preço de SOL MEDIDO na amostra, nunca uma constante.
+ */
+export function portfolioSetup(params: {
+  mints: number;
+  rentLamportsPerAta: number;
+  createTxFeeLamports: number | null;
+  solUsdcMeasuredPrice: number | null;
+}): PortfolioSetupCost {
+  const { mints, rentLamportsPerAta, createTxFeeLamports, solUsdcMeasuredPrice } = params;
+  const totalRentLamports = mints * rentLamportsPerAta;
+  return {
+    mints,
+    rentLamportsPerAta,
+    totalRentLamports,
+    totalRentUsdc:
+      solUsdcMeasuredPrice != null ? lamportsToUsdc(totalRentLamports, solUsdcMeasuredPrice) : null,
+    createTxFeeLamports,
+    createTxFeeUsdc:
+      createTxFeeLamports != null && solUsdcMeasuredPrice != null
+        ? lamportsToUsdc(createTxFeeLamports * mints, solUsdcMeasuredPrice)
+        : null,
+    rentRecoverable: true,
   };
 }
 

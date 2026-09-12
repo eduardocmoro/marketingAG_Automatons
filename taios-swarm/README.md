@@ -17,6 +17,8 @@ depois que houver edge validado em paper.
 2. **Nunca afirmar que uma estratégia "vai dar lucro".** Só expectativa líquida com
    intervalo de confiança e tamanho de amostra.
 3. **Chave privada nunca no repositório, nunca em commit, nunca em log.**
+4. **Uma hot wallet compartilhada, agentes virtuais.** Nunca um keypair por
+   agente. Decisão irreversível — ver [ADR-001](docs/ADR-001-carteira-unica.md).
 
 ---
 
@@ -80,9 +82,23 @@ Zero código de estratégia. O que é medido:
 | Priority fee | `getRecentPrioritizationFees`, distribuição (mediana e p90), não ponto único |
 | Fee de pool | `routePlan` real da quote — venue, `feeAmount`, `feeMint`, nº de hops por salto. Nada fixado em 0,25% |
 | Price impact cotado | `priceImpactPct` da quote, **nas duas direções** (assimétrico em CLMM) |
-| Rent de ATA | `getMinimumBalanceForRentExemption(165)` — capital travado **recuperável**, separado do afundado |
+| Rent de ATA | `getMinimumBalanceForRentExemption(165)` — custo de **setup, uma vez**, não por trade |
 
 Tamanhos: **0,50 / 1 / 2 / 5** USDC (núcleo da tese) + 10 / 50 / 100 / 500 (escala).
+
+### Rent de ATA não é custo por trade
+
+Uma ATA é criada **uma vez por (carteira, mint)** e reusada por todos os trades
+seguintes, de todos os agentes. Sob [ADR-001](docs/ADR-001-carteira-unica.md) o
+enxame inteiro usa uma carteira só, então são **N ATAs no total, para sempre** —
+uma por mint negociado, não uma por posição nem uma por agente.
+
+- rent por ATA: 0,00204 SOL, **recuperável** (volta integralmente no close)
+- 5 mints do núcleo: ~0,0102 SOL travados, **uma vez**
+- custo por trade: **zero** — não escala com o número de trades
+
+Por isso o rent ficou fora de `RoundTripCost` e do cálculo de break-even. O
+relatório converte pelo preço de SOL **medido na amostra**, nunca por constante.
 
 Round trip é medido de ponta a ponta: entra com N USDC, a perna 2 usa exatamente
 o `outAmount` da perna 1, sai com M USDC. `swapLoss = N − M` captura fee de pool e
@@ -97,11 +113,14 @@ cd taios-swarm
 export SOLANA_RPC_URL='https://mainnet.helius-rpc.com/?api-key=SUA_CHAVE'
 
 bash scripts/run-day1.sh            # 1 amostra + relatório
-bash scripts/run-day1.sh 12 300     # 12 amostras a cada 5 min + relatório
+bash scripts/run-day1.sh 8 300      # 1 bloco: 8 amostras a cada 5 min
 ```
 
-Saída bruta em `measurements/day1_costs.jsonl` (**append-only** — rode em dias e
-horários diferentes para acumular distribuição; um retrato único não serve).
+**Um bloco não fecha o Day 1.** Oito amostras seguidas cobrem ~40 minutos: um
+único regime de congestionamento. O mínimo é **3 blocos em horários distintos ao
+longo de 2 dias**, acumulando no mesmo `measurements/day1_costs.jsonl`
+(append-only). O relatório detecta a cobertura, avisa enquanto ela for
+insuficiente, e mediana/p90 só descrevem o regime geral depois disso.
 
 Relatório isolado:
 
@@ -130,6 +149,8 @@ por falta de fundos. Sobrescreva com `MEASURE_PUBKEY` se preferir outro.
 
 ```
 taios-swarm/
+  docs/
+    ADR-001-carteira-unica.md   decisão irreversível de arquitetura
   scripts/
     measure-day1.mjs      medição (sem estratégia)
     run-day1.sh           acumula amostras + relatório
@@ -149,6 +170,6 @@ taios-swarm/
 |---|---|
 | 1 | Custo real medido. Tabela de round trip por tamanho, mediana e p90. **Sem código de estratégia.** |
 | 2–3 | Data layer: WebSocket + candles em SQLite (SOL/USDC, JUP, RAY) |
-| 4–5 | Cost model fechado + um agente paper (vetor único), 48h de paper |
+| 4–5 | Cost model fechado + **ledger virtual** (ADR-001 §1 e §2) + um agente paper (vetor único), 48h de paper |
 | 6–8 | População + evolução + classificador de regime + população de controle |
 | 9+ | Split temporal, validação em passagem única, relatório com os 4 números obrigatórios |
