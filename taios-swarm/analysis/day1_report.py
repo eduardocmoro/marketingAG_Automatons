@@ -640,20 +640,21 @@ def decomposition_section(conn, sol_price):
     """
     Custo de rede é FIXO em dólar; taxa de pool é PERCENTUAL.
 
-    Logo, como % da posição, a rede CRESCE quando a posição encolhe e o pool
-    fica constante. Descobrir tier baixo reduz o componente que já era menor
-    em posição pequena — não salva o desenho.
+    Como % da posição, a rede CRESCE quando a posição encolhe e o pool fica
+    constante. Descobrir tier baixo reduz o componente que já era menor em
+    posição pequena — não salva o desenho.
 
-    O cruzamento entre as duas curvas é o TAMANHO MÍNIMO ECONOMICAMENTE
-    RACIONAL: abaixo dele o custo é dominado por uma taxa que não diminui
-    por mais que a ordem encolha.
+    Emitido em DUAS versões: rede na mediana e rede no p90 da priority fee.
+    A versão p90 descreve o pior caso operacional e é ela que decide o
+    desenho — deixar só a mediana visível subestima o custo por ~8x.
 
         rede_pct(tam) = rede_usd / tam × 100
         pool_pct      = constante
         cruzamento    = rede_usd × 100 / pool_pct
     """
     rows = conn.execute(
-        "SELECT position_size_usdc, AVG(net_lamports_median), AVG(fee_routeplan_pct), COUNT(*) "
+        "SELECT position_size_usdc, AVG(net_lamports_median), AVG(net_lamports_p90), "
+        "       AVG(fee_routeplan_pct), COUNT(*) "
         "FROM round_trip WHERE error IS NULL AND net_lamports_median IS NOT NULL "
         "GROUP BY position_size_usdc ORDER BY position_size_usdc"
     ).fetchall()
@@ -666,52 +667,67 @@ def decomposition_section(conn, sol_price):
         return {}
 
     print()
-    print(f"  {'TAMANHO':>9} | {'REDE US$':>10} | {'REDE %':>9} | {'POOL %':>9} | {'DOMINANTE':>12}")
-    print("  " + "-" * 66)
-    out = []
-    net_usds, pool_pcts = [], []
-    for size, net_lamports, pool_pct, n in rows:
-        net_usd = net_lamports / LAMPORTS_PER_SOL * sol_price
-        net_pct = net_usd / size * 100
-        net_usds.append(net_usd)
+    print(f"  {'':>8} {'':>9}   {'--- REDE NA MEDIANA ---':^24}  {'--- REDE NO p90 ---':^24}")
+    print(f"  {'TAMANHO':>8} {'POOL %':>9} | {'US$':>9} {'% POS':>8} {'DOMIN':>10} | "
+          f"{'US$':>9} {'% POS':>8} {'DOMIN':>10}")
+    print("  " + "-" * 74)
+
+    out, net_med_usds, net_p90_usds, pool_pcts = [], [], [], []
+    for size, net_med, net_p90, pool_pct, n in rows:
+        nm = net_med / LAMPORTS_PER_SOL * sol_price
+        np90 = (net_p90 / LAMPORTS_PER_SOL * sol_price) if net_p90 else None
+        nm_pct = nm / size * 100
+        np_pct = (np90 / size * 100) if np90 else None
+        net_med_usds.append(nm)
+        if np90:
+            net_p90_usds.append(np90)
         if pool_pct is not None:
             pool_pcts.append(pool_pct)
-        if pool_pct is None:
-            dom, pool_s = "—", "—"
-        else:
-            ratio = net_pct / pool_pct if pool_pct > 0 else float("inf")
-            dom = f"rede {ratio:.1f}x" if ratio >= 1 else f"pool {1/ratio:.1f}x"
-            pool_s = f"{pool_pct:.4f}"
-        print(f"  {'$' + format(size, 'g'):>9} | {net_usd:>10.6f} | {net_pct:>8.4f}% | "
-              f"{pool_s:>9} | {dom:>12}")
-        out.append({"position_usdc": size, "network_usd": net_usd,
-                    "network_pct": net_pct, "pool_pct": pool_pct})
 
-    # ── Cruzamento ──
-    if net_usds and pool_pcts:
-        net_ref = statistics.median(net_usds)
+        def dom(net_pct):
+            if pool_pct is None or pool_pct <= 0 or net_pct is None:
+                return "—"
+            r = net_pct / pool_pct
+            return f"rede {r:.1f}x" if r >= 1 else f"pool {1/r:.1f}x"
+
+        pool_s = "—" if pool_pct is None else f"{pool_pct:.4f}"
+        p90_cells = (f"{np90:>9.6f} {np_pct:>7.4f}% {dom(np_pct):>10}"
+                     if np90 else f"{'—':>9} {'—':>8} {'—':>10}")
+        print(f"  {'$' + format(size, 'g'):>8} {pool_s:>9} | "
+              f"{nm:>9.6f} {nm_pct:>7.4f}% {dom(nm_pct):>10} | {p90_cells}")
+        out.append({"position_usdc": size, "pool_pct": pool_pct,
+                    "network_median_usd": nm, "network_median_pct": nm_pct,
+                    "network_p90_usd": np90, "network_p90_pct": np_pct})
+
+    # ── Cruzamento nas duas versoes ──
+    cross_out = {}
+    if net_med_usds and pool_pcts:
+        ref_med = statistics.median(net_med_usds)
+        ref_p90 = statistics.median(net_p90_usds) if net_p90_usds else None
         print()
         print("  CRUZAMENTO — tamanho minimo economicamente racional")
-        print("  " + "-" * 66)
-        print(f"    rede de referencia: ${net_ref:.6f} por round trip (mediana entre tamanhos)")
+        print("  " + "-" * 74)
+        print(f"    rede por round trip: mediana ${ref_med:.6f}"
+              + (f" | p90 ${ref_p90:.6f}" if ref_p90 else ""))
         print()
-        print(f"    {'TIER POOL':>12} | {'CRUZAMENTO':>12} | interpretacao")
-        print("    " + "-" * 60)
+        print(f"    {'TIER POOL':>11} | {'CRUZAMENTO med':>15} | {'CRUZAMENTO p90':>15}")
+        print("    " + "-" * 50)
         for pool_pct in sorted(set(round(x, 4) for x in pool_pcts)):
             if pool_pct <= 0:
                 continue
-            cross = net_ref * 100 / pool_pct
-            print(f"    {pool_pct:>11.4f}% | {'$' + format(round(cross, 2), 'g'):>12} | "
-                  f"abaixo disso a REDE domina")
+            cm = ref_med * 100 / pool_pct
+            cp = (ref_p90 * 100 / pool_pct) if ref_p90 else None
+            print(f"    {pool_pct:>10.4f}% | {'$' + format(round(cm, 2), 'g'):>15} | "
+                  + (f"{'$' + format(round(cp, 2), 'g'):>15}" if cp else f"{'—':>15}"))
+            cross_out[str(round(pool_pct, 4))] = {"median": cm, "p90": cp}
         print()
-        print("    Tier MENOR empurra o cruzamento para CIMA: com pool barato e preciso")
-        print("    uma posicao MAIOR antes que a taxa de pool passe a importar.")
-        print("    Em posicao pequena o gargalo e a taxa fixa de rede, nao o pool.")
-        out_cross = {str(round(pp, 4)): net_ref * 100 / pp
-                     for pp in set(pool_pcts) if pp > 0}
-    else:
-        out_cross = {}
-    return {"by_size": out, "crossover_usdc_by_pool_pct": out_cross}
+        print("    Abaixo do cruzamento a REDE domina — taxa que nao diminui por mais")
+        print("    que a ordem encolha. Tier MENOR empurra o cruzamento para CIMA.")
+        if ref_p90:
+            print()
+            print("    A coluna p90 e a que descreve o pior caso operacional. Um desenho")
+            print("    que so fecha na coluna mediana nao fecha em congestionamento.")
+    return {"by_size": out, "crossover_usdc": cross_out}
 
 
 def dispersion_section(conn, sol_price):

@@ -311,6 +311,37 @@ Esse ponto é o **tamanho mínimo economicamente racional** — abaixo dele o cu
 **menor** empurra o cruzamento para **cima**: com pool barato é preciso posição
 maior antes que o pool passe a importar.
 
+A tabela sai em **duas versões lado a lado**: rede na mediana e rede no p90 da
+priority fee. A coluna p90 é a que descreve o pior caso operacional, e é ela que
+decide o desenho — deixar só a mediana visível subestima o custo por ~8x. O
+cruzamento também sai nas duas: com tier de 0,02%, ~US$5 na mediana e ~US$42 no
+p90. **Um desenho que só fecha na coluna mediana não fecha em congestionamento.**
+
+### Decisão de desenho: abstenção por priority fee
+
+*(registrado agora, implementado no Day 4–5)*
+
+A cauda de priority fee **não é custo inevitável**. A fee é **observável antes de
+assinar** — o agente consulta `getRecentPrioritizationFees` e decide. Logo a cauda
+é **critério de abstenção**, não custo esperado: um agente que recusa operar acima
+de um limiar paga próximo da mediana na maior parte do tempo.
+
+Isso entra no vetor de parâmetros como **`max_priority_fee_to_trade`**, evoluído
+por agente ao lado de `slippageBps`:
+
+- **limiar baixo** → paga perto da mediana, mas opera menos
+- **limiar alto** → opera sempre, mas come a cauda
+
+**Ressalva que precisa estar escrita para não virar otimismo silencioso:** se o
+sinal aparecer preferencialmente em janelas congestionadas — e volatilidade e
+congestionamento **correlacionam** — então o filtro corta sinal junto com custo, e
+o ganho líquido da abstenção pode ser zero ou negativo. Um agente que só opera no
+mercado calmo pode estar recusando exatamente as janelas em que havia edge.
+
+Isso é **mensurável no Day 2–3** com histórico (correlação entre priority fee e
+magnitude de movimento de preço na mesma janela), **não agora**. Até lá,
+`max_priority_fee_to_trade` é hipótese de desenho, não solução.
+
 #### Ressalva: tier de CLMM vale para o tamanho medido
 
 Pool de 1–5 bps é **liquidez concentrada em faixa estreita**. Fora da faixa o
