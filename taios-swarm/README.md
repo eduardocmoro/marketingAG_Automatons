@@ -121,20 +121,92 @@ A medição cota em t0 e recota o **mesmo par e tamanho** após cada horizonte,
 registrando o delta de `outAmount` em bps. Isso produz um **piso empírico de
 slippage sem executar nada**.
 
-A mediana com sinal tende a zero (o preço anda para os dois lados); o que custa é
-a **magnitude**, porque metade das vezes ela joga contra. O break-even sensível a
-latência usa essa magnitude:
+#### `|drift|` não é custo aditivo
+
+Drift é **sinalizado**, e num swap o `outAmount` favorável é capturado
+integralmente. Somar o módulo trataria todo movimento como adverso — uma
+penalidade de momentum aplicada inclusive a agentes de reversão à média, para quem
+o mesmo drift é favorável.
+
+O custo do drift é **condicional à direção do sinal do agente**, não constante
+global. A distribuição **sinalizada** fica preservada em
+`quoted_drift_signed_percentiles` e o custo é aplicado por agente na camada de
+evolução.
+
+#### O canal de custo é reversão
 
 ```
-break_even = swapLoss + networkCost + |drift(latência)|
+drift favorável                → capturado integralmente
+adverso dentro da tolerância   → custo real, condicional ao sinal
+adverso além da tolerância     → instrução falha, tx reverte,
+                                 paga taxa de rede sem posição
 ```
 
-O relatório imprime a coluna sem drift e com drift em 1s e 2s, para mostrar quanto
-a velocidade do loop custa ao desenho.
+Daí sai o que **é** global e mensurável na Fase 1: dada uma tolerância de
+slippage, a distribuição de drift medida dá a probabilidade de estourá-la.
+
+A tolerância limita **apenas o lado adverso**, então a probabilidade é
+unilateral — `P(drift < −tol)` por perna, não `P(|drift| > tol)`. Para o round
+trip, `1 − (1−p)²`.
+
+Registrado como `revert_rate_floor_by_slippage_bps`, **separado de
+`txFailureRate`**: falha por congestionamento, blockhash expirado ou saldo
+reservado não devolvido vem de outros canais e não sai do drift. `txFailureRate`
+segue `null` até a Fase 2.
 
 O horizonte real de cada ponto fica entre `elapsedMsAtRequest` e
 `elapsedMsAtResponse` — os dois são registrados em vez de assumir que a espera
 nominal foi exata.
+
+### Entrega do Day 1: uma curva, não um número
+
+Break-even em função da **tolerância de slippage**, por tamanho de trade:
+
+| Coluna | O que é |
+|---|---|
+| determinístico | `swapLoss + networkCost` |
+| `P(revert)` | piso de reversão por perna, medido do drift |
+| gás desperdiçado | `networkCost × p/(1−p)` por round trip bem-sucedido |
+| BE sem sandwich | braço esquerdo — **medido** |
+| sandwich máx | `posição × tol/10000` — teto aritmético, **não medido** |
+| BE com sandwich | curva fechada, com mínimo |
+
+A curva tem dois braços:
+
+- **esquerdo** (tolerância apertada) → reversão, gás desperdiçado. **Mensurável
+  agora.**
+- **direito** (tolerância larga) → sandwich extrai até o limite autorizado, e o
+  drift deixa de ser simétrico e vira adversarial. **Não mensurável na Fase 1.**
+
+O braço esquerdo sozinho é monotonicamente decrescente e **não tem mínimo** — o
+mínimo só aparece ao fechar o braço direito com o teto de sandwich. Por isso o
+relatório marca explicitamente que o mínimo vale sob a hipótese de que todo trade
+é sanduichado até o limite. Em posição de US$1 a extração pode não compensar o gás
+do atacante, o que empurraria o mínimo para a direita — **hipótese a testar na
+Fase 2, não resultado do Day 1**.
+
+#### Resolução de cauda
+
+`P(revert)` é uma probabilidade de cauda: com `n` amostras a resolução é `1/n`.
+Tolerâncias onde nenhuma amostra estourou aparecem marcadas com `<` — o valor é
+um **teto de 1/n, não zero**. Quando mais da metade da grade cai nessa condição, o
+relatório avisa que o mínimo não é confiável.
+
+Cada bloco de 8 amostras gera 8 pontos de drift por horizonte (um por tamanho de
+trade, em janelas de ~5s disjuntas). Para resolver reversão de 0,5% são precisos
+~200 pontos ≈ 25 blocos; para 0,1%, ~1000 pontos. Decida a grade de tolerância
+pelo que você precisa resolver.
+
+### `slippageBps` é parâmetro evoluído, não constante
+
+Não existe valor global correto:
+
+- **apertado** → mais reversão, gás desperdiçado em tentativas que falham
+- **largo** → sandwich extrai até o limite autorizado
+
+Entra no vetor de parâmetros do agente, ao lado de janela e limiar de entrada. A
+grade em `SLIPPAGE_GRID_BPS` existe só para desenhar a curva — não é configuração
+de produção.
 
 Round trip é medido de ponta a ponta: entra com N USDC, a perna 2 usa exatamente
 o `outAmount` da perna 1, sai com M USDC. `swapLoss = N − M` captura fee de pool e

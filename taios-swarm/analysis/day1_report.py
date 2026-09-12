@@ -95,8 +95,20 @@ CREATE TABLE IF NOT EXISTS quote_drift (
 );
 """
 
-# Horizontes usados nas colunas de break-even sensível à latência.
+# Horizontes de latência usados na curva de custo.
 BREAK_EVEN_HORIZONS_MS = [1000, 2000]
+
+# Grade de tolerância de slippage (bps). slippageBps é parâmetro EVOLUÍDO por
+# agente, não constante global — esta grade existe só para desenhar a curva e
+# achar onde ela tem mínimo.
+SLIPPAGE_GRID_BPS = [5, 10, 25, 50, 100, 200, 300, 500]
+
+# Abaixo disto a cauda da distribuição de drift não tem resolução e a taxa de
+# reversão calculada não significa nada.
+MIN_DRIFT_SAMPLES = 30
+
+# Posição central da tese — a curva é desenhada em detalhe para ela.
+THESIS_POSITION_USDC = 1.0
 
 
 def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
@@ -283,6 +295,197 @@ def drift_stats(conn, size=None):
             "median_abs": statistics.median(absv),
             "p90_abs": pct(absv, 0.9),
         }
+    return out
+
+
+def signed_percentiles(conn):
+    """
+    Distribuição SINALIZADA de drift por horizonte, para a camada de evolução.
+
+    Guardada com sinal de propósito: o custo do drift é condicional à direção
+    do sinal do agente. Um agente de momentum e um de reversão à média veem o
+    mesmo drift com sinais opostos. Colapsar em |x| aqui destruiria
+    exatamente a informação que a evolução precisa.
+    """
+    by_h = {}
+    for h, d in conn.execute(
+        "SELECT nominal_horizon_ms, drift_bps FROM quote_drift "
+        "WHERE drift_bps IS NOT NULL AND nominal_horizon_ms > 0"
+    ):
+        by_h.setdefault(h, []).append(d)
+    return {
+        str(h): {
+            "n": len(v),
+            "p05": pct(v, 0.05),
+            "p25": pct(v, 0.25),
+            "p50": pct(v, 0.50),
+            "p75": pct(v, 0.75),
+            "p95": pct(v, 0.95),
+        }
+        for h, v in sorted(by_h.items())
+    }
+
+
+def revert_floor(conn, horizon_ms, tolerances_bps=SLIPPAGE_GRID_BPS):
+    """
+    Piso de taxa de reversão, derivado da distribuição de drift medida.
+
+    A tolerância de slippage limita APENAS o lado adverso: se o preço anda a
+    favor o swap captura o ganho, se anda contra além da tolerância a
+    instrução falha e a tx reverte. Logo a probabilidade relevante é
+    unilateral — P(drift < −tol) numa perna USDC->SOL — e não P(|drift| > tol).
+
+    Pool entre tamanhos de posição: drift é movimento de preço, praticamente
+    independente do tamanho. Sem pool não há amostra para resolver a cauda.
+
+    Isto NÃO é txFailureRate: falha por congestionamento, blockhash expirado
+    ou saldo reservado não devolvido vem de outros canais e não sai do drift.
+    """
+    vals = [
+        r[0]
+        for r in conn.execute(
+            "SELECT drift_bps FROM quote_drift "
+            "WHERE drift_bps IS NOT NULL AND nominal_horizon_ms = ?",
+            (horizon_ms,),
+        )
+    ]
+    n = len(vals)
+    out = []
+    for tol in tolerances_bps:
+        if n == 0:
+            out.append(
+                {"tol_bps": tol, "p_leg": None, "p_round_trip": None, "n": 0, "upper_bound": False}
+            )
+            continue
+        adverse = sum(1 for v in vals if v < -tol)
+        if adverse == 0:
+            p, upper = 1.0 / n, True  # teto de resolução da amostra, não zero
+        else:
+            p, upper = adverse / n, False
+        out.append(
+            {
+                "tol_bps": tol,
+                "p_leg": p,
+                "p_round_trip": 1 - (1 - p) ** 2,
+                "n": n,
+                "upper_bound": upper,
+            }
+        )
+    return out
+
+
+def curve_section(conn, summary, dstats):
+    """
+    Entrega do Day 1: break-even em função da tolerância de slippage.
+
+    Dois braços:
+      esquerdo (tol apertada) — reversão, MENSURÁVEL agora pelo drift
+      direito  (tol larga)    — sandwich, NÃO mensurável na Fase 1
+
+    O braço esquerdo sozinho é monotonicamente decrescente e não tem mínimo.
+    O mínimo aparece quando se fecha o braço direito com o teto aritmético de
+    sandwich (um atacante extrai, no limite, toda a tolerância autorizada).
+    A curva real está entre os dois; a frequência de sandwich só sai da Fase 2.
+    """
+    out = {}
+    thesis = next(
+        (s for s in summary if abs(s["position_usdc"] - THESIS_POSITION_USDC) < 1e-9), None
+    )
+    if thesis is None:
+        print()
+        print(f"  Sem amostra de US${THESIS_POSITION_USDC:g} — curva não desenhada.")
+        return out
+
+    det_usdc = thesis["total_sunk_median_usdc"]
+    net_usdc = thesis["network_median_usdc"]
+    pos = thesis["position_usdc"]
+    if det_usdc is None or net_usdc is None:
+        print()
+        print("  Custo determinístico incompleto — curva não desenhada.")
+        return out
+
+    for horizon in BREAK_EVEN_HORIZONS_MS:
+        floors = revert_floor(conn, horizon)
+        n = floors[0]["n"] if floors else 0
+
+        print()
+        print("=" * 78)
+        print(f"  CURVA DE BREAK-EVEN POR TOLERANCIA — POSICAO US${pos:g}, LATENCIA {horizon}ms")
+        print("=" * 78)
+
+        if n < MIN_DRIFT_SAMPLES:
+            print()
+            print(f"  Amostras de drift neste horizonte: {n} (minimo {MIN_DRIFT_SAMPLES}).")
+            print("  A cauda da distribuicao nao tem resolucao — curva NAO desenhada.")
+            print("  Rode mais blocos: a taxa de reversao depende da cauda, nao do centro.")
+            continue
+
+        print(f"  n = {n} amostras de drift (pool entre tamanhos)")
+        print()
+        print(f"  {'TOL':>5} | {'P(REVERT)':>10} | {'GAS DESP.':>10} | {'BE SEM':>9} | "
+              f"{'SANDW MAX':>10} | {'BE COM':>9}")
+        print(f"  {'bps':>5} | {'por perna':>10} | {'US$':>10} | {'SANDW %':>9} | "
+              f"{'US$':>10} | {'SANDW %':>9}")
+        print("  " + "-" * 68)
+
+        rows = []
+        for f in floors:
+            p = f["p_leg"]
+            if p is None or p >= 1:
+                continue
+            wasted = net_usdc * (p / (1 - p))
+            cost_opt = det_usdc + wasted
+            sandwich = pos * (f["tol_bps"] / 10_000)
+            cost_pes = cost_opt + sandwich
+            row = {
+                "tol_bps": f["tol_bps"],
+                "p_leg": p,
+                "p_leg_is_upper_bound": f["upper_bound"],
+                "p_round_trip": f["p_round_trip"],
+                "wasted_gas_usdc": wasted,
+                "break_even_no_sandwich_pct": cost_opt / pos * 100,
+                "sandwich_upper_bound_usdc": sandwich,
+                "break_even_with_sandwich_pct": cost_pes / pos * 100,
+            }
+            rows.append(row)
+            mark = "<" if f["upper_bound"] else " "
+            print(
+                f"  {f['tol_bps']:>5} | {p * 100:>9.2f}%{mark} | {wasted:>10.6f} | "
+                f"{row['break_even_no_sandwich_pct']:>8.3f}% | {sandwich:>10.6f} | "
+                f"{row['break_even_with_sandwich_pct']:>8.3f}%"
+            )
+
+        if any(r["p_leg_is_upper_bound"] for r in rows):
+            print()
+            print(f"  '<' = nenhuma amostra estourou essa tolerancia; p e TETO de 1/n,")
+            print(f"        nao zero. A amostra so nao resolve essa cauda.")
+
+        if rows:
+            best = min(rows, key=lambda r: r["break_even_with_sandwich_pct"])
+            n_upper = sum(1 for r in rows if r["p_leg_is_upper_bound"])
+            if n_upper > len(rows) / 2:
+                print()
+                print("  " + "!" * 68)
+                print(f"  BRACO ESQUERDO SUB-RESOLVIDO: {n_upper} de {len(rows)} tolerancias")
+                print(f"  caem abaixo da resolucao da amostra (1/{n} = {100/n:.2f}%).")
+                print("  A curva fica artificialmente plana a direita e o MINIMO ABAIXO")
+                print("  NAO E CONFIAVEL — ele so reflete onde a amostra parou de ver cauda.")
+                print("  Para resolver reversao de 0.1% sao necessarias ~1000 amostras.")
+                print("  " + "!" * 68)
+            print()
+            print(f"  MINIMO DA CURVA COM SANDWICH: {best['tol_bps']} bps  ->  "
+                  f"{best['break_even_with_sandwich_pct']:.3f}%")
+            print(f"    reversao por perna {best['p_leg']*100:.2f}%, "
+                  f"round trip {best['p_round_trip']*100:.2f}%")
+            print()
+            print("  LEITURA: o braco esquerdo (reversao) e MEDIDO; o direito (sandwich)")
+            print("  e o teto aritmetico, nao medicao. O minimo acima e onde a curva")
+            print("  para sob a hipotese de que TODO trade e sanduichado ate o limite.")
+            print("  Em posicao de US$1 a extracao pode nao compensar o gas do atacante,")
+            print("  o que empurraria o minimo para a direita — isso e hipotese a testar")
+            print("  na Fase 2, nao resultado deste Day 1.")
+            out[f"{horizon}ms"] = {"rows": rows, "min_with_sandwich": best, "samples": n}
+
     return out
 
 
@@ -545,34 +748,15 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
                 f"{fmt(d['p90_abs'], 2):>12}"
             )
         print()
-        print("  A mediana com sinal tende a zero — o preco anda para os dois lados.")
-        print("  O que custa e a MAGNITUDE: metade das vezes ela joga contra.")
+        print("  Mediana com sinal tende a zero — o preco anda para os dois lados.")
+        print("  |drift| NAO entra como custo aditivo no break-even: o swap captura")
+        print("  o lado favoravel integralmente. Somar o modulo seria penalidade de")
+        print("  momentum aplicada tambem a agentes de reversao. O custo do drift e")
+        print("  condicional a direcao do sinal e vive na camada de evolucao.")
+        print("  O que e global e mensuravel aqui e a REVERSAO — tabela abaixo.")
 
-        # ── Break-even sensivel a velocidade do loop ──
-        print()
-        print("-" * 78)
-        print("  BREAK-EVEN SENSIVEL A VELOCIDADE DO LOOP")
-        print("  break_even = swapLoss + rede + |drift(latencia)|   (caso adverso)")
-        print("-" * 78)
-        print()
-        cols = " | ".join(f"{'+' + str(h) + 'ms':>11}" for h in BREAK_EVEN_HORIZONS_MS)
-        print(f"  {'POSIÇÃO':>9} | {'SEM DRIFT':>11} | {cols}")
-        print("  " + "-" * 62)
-        for s in summary:
-            cells = []
-            for h in BREAK_EVEN_HORIZONS_MS:
-                d = dstats.get(h)
-                base_be = s["break_even_move_median_pct"]
-                if d is None or base_be is None or d["median_abs"] is None:
-                    cells.append(f"{'—':>11}")
-                else:
-                    be = base_be + d["median_abs"] / 100
-                    s[f"break_even_with_drift_{h}ms_pct"] = be
-                    cells.append(f"{fmt(be, 3) + '%':>11}")
-            print(
-                f"  {'$' + format(s['position_usdc'], 'g'):>9} | "
-                f"{fmt(s['break_even_move_median_pct'], 3) + '%':>11} | " + " | ".join(cells)
-            )
+    # ── A entrega do Day 1: curva de custo por tolerancia ──
+    curve_out = curve_section(conn, summary, dstats)
 
     # ── Leitura direta ──
     one = next((s for s in summary if abs(s["position_usdc"] - 1.0) < 1e-9), None)
@@ -668,9 +852,17 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
                     "congestion_varied": cov["congestion_varied"],
                     "sufficient": cov["sufficient"],
                 },
+                # Distribuição SINALIZADA — a camada de evolução condiciona o
+                # custo à direção do sinal de cada agente. Não colapsar em |x|.
                 "quoted_drift_bps_by_latency": {
                     str(h): dstats[h] for h in sorted(dstats)
                 },
+                "quoted_drift_signed_percentiles": signed_percentiles(conn),
+                # Piso de reversão vindo do drift. NÃO é txFailureRate.
+                "revert_rate_floor_by_slippage_bps": {
+                    f"{h}ms": revert_floor(conn, h) for h in BREAK_EVEN_HORIZONS_MS
+                },
+                "break_even_curve": curve_out,
             },
             indent=2,
         ),

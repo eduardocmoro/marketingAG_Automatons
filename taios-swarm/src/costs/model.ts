@@ -75,6 +75,17 @@ export interface LegCost {
    */
   realizedSlippagePct: number | null;
 
+  /**
+   * PARÂMETRO EVOLUÍDO POR AGENTE — não constante global.
+   *
+   *   apertado -> mais reversão, gás desperdiçado em tentativas que falham
+   *   largo    -> sandwich extrai até o limite autorizado, e aí o drift
+   *               deixa de ser simétrico e vira adversarial
+   *
+   * Faz parte do vetor de parâmetros do agente, como janela e limiar de
+   * entrada. A curva de custo por tolerância tem mínimo, e o mínimo é o que
+   * a evolução procura.
+   */
   slippageBps: number | null;
   otherAmountThreshold: string | null;
   route: Route;
@@ -266,37 +277,86 @@ export function consolidate(params: {
 }
 
 /**
- * Break-even incluindo o custo do tempo.
+ * O canal de custo do drift é REVERSÃO, não degradação de fill.
  *
- *   breakEven = swapLoss + networkCost + |drift(latência assumida)|
+ *   drift favorável              -> capturado integralmente pelo swap
+ *   adverso dentro da tolerância -> custo real, mas condicional ao sinal
+ *   adverso além da tolerância   -> instrução falha, tx reverte,
+ *                                   paga taxa de rede sem posição
  *
- * O drift é aproximadamente simétrico — metade das vezes ajuda. Usar a
- * magnitude produz o break-even CONSERVADOR: o que é preciso mover para
- * empatar mesmo quando a latência jogou contra. É este o número que decide
- * se a velocidade do loop inviabiliza o desenho.
+ * Por isso |drift| NÃO entra como custo aditivo no break-even global: somar
+ * o módulo trata todo movimento como adverso, o que é uma penalidade de
+ * momentum aplicada até a agentes de reversão à média, para quem o mesmo
+ * drift é favorável. O custo do drift é CONDICIONAL À DIREÇÃO DO SINAL e
+ * pertence à camada de evolução, por agente — não a esta constante global.
+ *
+ * O que é global e mensurável na Fase 1 é a reversão: dada uma tolerância,
+ * a distribuição de drift medida dá a probabilidade de estourá-la.
  */
-export function breakEvenWithLatency(
-  cost: RoundTripCost,
-  absDriftBpsAtLatency: number
-): number | null {
-  if (cost.totalSunkCostPct == null) return null;
-  return cost.totalSunkCostPct + absDriftBpsAtLatency / 100;
+export interface RevertRateFloor {
+  slippageToleranceBps: number;
+  latencyHorizonMs: number;
+  /** P(drift adverso além da tolerância) numa perna. */
+  pAdverseSingleLeg: number;
+  /** 1 − (1−p)²: ao menos uma das duas pernas reverte. */
+  pRoundTrip: number;
+  samples: number;
+  /**
+   * true quando nenhuma amostra estourou a tolerância. Nesse caso p é um
+   * TETO de 1/n, não zero — a amostra só não resolve essa cauda.
+   */
+  isUpperBound: boolean;
 }
 
 /**
- * FASE 2: custo efetivo quando parte das transações falha.
+ * Custo esperado por round trip BEM-SUCEDIDO, dada a taxa de reversão.
  *
- * Uma tentativa que falha ainda paga taxa de rede e não gera posição, então
- * para obter um round trip bem-sucedido são necessárias 1/(1-f) tentativas.
+ * Cada perna precisa de 1/(1−p) tentativas em média, e cada tentativa
+ * revertida paga taxa de rede sem gerar posição:
  *
- * Lança na Fase 1 de propósito — é o mesmo guard do realizedSlippage, pela
- * mesma razão: sem execução real este número não existe.
+ *   E[custo] = swapLoss + networkCost / (1 − p)
+ *
+ * Não inclui o adverso-dentro-da-tolerância: esse é condicional ao sinal do
+ * agente e entra na camada de evolução, não aqui.
+ */
+export function expectedCostWithReverts(params: {
+  swapLossUsdc: number;
+  networkCostUsdc: number;
+  pRevertPerLeg: number;
+}): { expectedUsdc: number; wastedGasUsdc: number } {
+  const { swapLossUsdc, networkCostUsdc, pRevertPerLeg: p } = params;
+  if (p < 0 || p >= 1) throw new Error(`pRevertPerLeg fora de [0,1): ${p}`);
+  const wastedGasUsdc = networkCostUsdc * (p / (1 - p));
+  return { expectedUsdc: swapLossUsdc + networkCostUsdc + wastedGasUsdc, wastedGasUsdc };
+}
+
+/**
+ * Teto de extração por sandwich: no limite, um atacante extrai toda a
+ * tolerância autorizada.
+ *
+ * NÃO é medição — é o pior caso aritmético. A frequência real de sandwich
+ * só sai da Fase 2. Serve para fechar o braço direito da curva: sem ele a
+ * curva de custo por tolerância é monotonicamente decrescente e não tem
+ * mínimo, o que é um artefato de só medir o braço esquerdo.
+ */
+export function sandwichUpperBoundUsdc(positionUsdc: number, slippageBps: number): number {
+  return positionUsdc * (slippageBps / 10_000);
+}
+
+/**
+ * FASE 2: custo efetivo quando parte das transações falha por canais que o
+ * drift NÃO explica — congestionamento, saldo reservado não devolvido,
+ * blockhash expirado.
+ *
+ * Lança na Fase 1 de propósito. O piso de reversão vindo do drift
+ * (RevertRateFloor) é mensurável agora; txFailureRate não é, e somar os
+ * dois sem medir seria dobrar a mesma incerteza.
  */
 export function effectiveCostWithFailures(cost: RoundTripCost): number {
   if (cost.txFailureRate == null) {
     throw new Error(
       "txFailureRate ausente: só existe após execução real (Fase 2). " +
-        "Não estime a taxa de falha durante o paper trading."
+        "Use RevertRateFloor para a parcela que o drift explica."
     );
   }
   if (cost.txFailureRate < 0 || cost.txFailureRate >= 1) {
@@ -306,9 +366,7 @@ export function effectiveCostWithFailures(cost: RoundTripCost): number {
     throw new Error("custo base incompleto: não dá para somar falhas em cima.");
   }
   const f = cost.txFailureRate;
-  // Cada tentativa falha custa só a taxa de rede (não houve swap).
-  const wastedAttempts = f / (1 - f);
-  return cost.totalSunkCostUsdc + wastedAttempts * cost.networkCostUsdc;
+  return cost.totalSunkCostUsdc + (f / (1 - f)) * cost.networkCostUsdc;
 }
 
 /**
