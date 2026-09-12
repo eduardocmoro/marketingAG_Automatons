@@ -339,55 +339,58 @@ export function sandwichUpperBoundUsdc(positionUsdc: number, slippageBps: number
 }
 
 /**
- * Piso econômico do MEV.
+ * Estimativa MOLE de limiar de triagem do searcher. NÃO É MEDIÇÃO.
  *
- * O braço direito da curva não precisa de medição de sandwich: resolve-se
- * pela economia do atacante. Sanduichar exige DUAS transações e ganhar uma
- * corrida de priority fee. Abaixo de certo tamanho de posição a extração não
- * cobre esse custo e o ataque simplesmente não fecha.
+ * Não existe "piso econômico" por custo marginal de transação. MEV na Solana
+ * opera por bundle com tip leiloado competitivamente: o tip ACOMPANHA a
+ * extração, então o custo do atacante sobe junto com o ganho e não forma
+ * piso fixo. Um searcher pode dar lance em praticamente qualquer extração
+ * positiva.
  *
- *   extração(pos, tol)  = pos × tol/10000
- *   custo do atacante   = 2 × (base_fee × sigs + cu_price_corrida × cu)
- *   limiar(tol)         = custo_do_atacante × 10000 / tol
+ * O que de fato protege a posição pequena é o LIMIAR DE TRIAGEM: overhead
+ * fixo por tentativa (infra, simulação, monitoramento) e o filtro de lucro
+ * mínimo que o searcher aplica antes de olhar o alvo. Isso é política de
+ * operação de terceiro, não aritmética — e não foi medido aqui.
  *
- * Abaixo do limiar a curva é monotonicamente decrescente em tol e não tem
- * mínimo: o que se reporta é a MENOR tolerância que zera reversão, não um
- * ponto de equilíbrio.
+ *   extração(pos, tol) = pos × tol/10000
+ *   limiar(tol)        ≈ overhead_de_triagem × 10000 / tol
  *
- * Premissas, e a direção do viés de cada uma:
- *  - atacante extrai a tolerância inteira -> superestima extração
- *    -> limiar menor -> conservador (assume MEV viável mais cedo)
- *  - priority fee de corrida no p90 medido -> pode subestimar uma guerra real
- *  - ignora custo de capital, risco de inventário e falha do próprio ataque
- *    -> subestima custo do atacante -> limiar menor -> conservador
- *  - bundles Jito trocam a corrida por tip; o custo muda de forma, não some
+ * `searcherOverheadProxyUsdc` usa 2× a taxa de uma tx de swap apenas como
+ * PROXY grosseiro desse overhead. O overhead real é provavelmente maior
+ * (infra e capital não aparecem numa taxa de rede), o que empurraria o
+ * limiar para cima — mas também pode ser menor para quem já roda a infra
+ * para outros alvos.
  *
- * O viés líquido empurra o limiar para BAIXO, então tratar a faixa de
- * operação como segura só quando ela estiver confortavelmente abaixo dele.
+ * Uso correto: operar com FOLGA GRANDE sob o limiar, nunca colado nele, e
+ * tratar o número como ordem de grandeza. Confirmação só com dado real.
  */
-export interface MevEconomicFloor {
+export interface MevTriageEstimate {
   slippageToleranceBps: number;
-  attackerCostUsdc: number;
-  /** Posição abaixo da qual a extração não cobre o custo do atacante. */
-  thresholdPositionUsdc: number;
-  /** true quando a posição operada fica sob o piso — sandwich não fecha. */
-  positionBelowFloor: boolean;
+  /** Proxy do overhead fixo de triagem. NÃO é o custo marginal do atacante. */
+  searcherOverheadProxyUsdc: number;
+  /** Posição abaixo da qual a extração provavelmente não passa na triagem. */
+  triageThresholdPositionUsdc: number;
+  /** true quando a posição fica sob o limiar estimado. Estimativa, não garantia. */
+  positionBelowTriageEstimate: boolean;
+  /** Sempre false na Fase 1 — nada aqui foi medido contra searchers reais. */
+  measured: false;
 }
 
-export function mevEconomicFloor(params: {
+export function mevTriageEstimate(params: {
   positionUsdc: number;
   slippageBps: number;
-  /** Taxa de rede de UMA transação de swap, em USDC, ao nível de corrida. */
-  attackerTxCostUsdc: number;
-}): MevEconomicFloor {
-  const { positionUsdc, slippageBps, attackerTxCostUsdc } = params;
-  const attackerCostUsdc = 2 * attackerTxCostUsdc; // front-run + back-run
-  const thresholdPositionUsdc = (attackerCostUsdc * 10_000) / slippageBps;
+  /** Taxa de rede de UMA tx de swap, em USDC — proxy do overhead de triagem. */
+  swapTxCostUsdc: number;
+}): MevTriageEstimate {
+  const { positionUsdc, slippageBps, swapTxCostUsdc } = params;
+  const searcherOverheadProxyUsdc = 2 * swapTxCostUsdc;
+  const triageThresholdPositionUsdc = (searcherOverheadProxyUsdc * 10_000) / slippageBps;
   return {
     slippageToleranceBps: slippageBps,
-    attackerCostUsdc,
-    thresholdPositionUsdc,
-    positionBelowFloor: positionUsdc < thresholdPositionUsdc,
+    searcherOverheadProxyUsdc,
+    triageThresholdPositionUsdc,
+    positionBelowTriageEstimate: positionUsdc < triageThresholdPositionUsdc,
+    measured: false,
   };
 }
 

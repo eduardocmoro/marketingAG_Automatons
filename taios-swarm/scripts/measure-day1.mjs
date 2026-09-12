@@ -168,6 +168,29 @@ async function jupSwapTx(quoteResponse) {
 }
 
 /**
+ * Assinatura de rota: pools concretos e split. Duas quotes com a mesma
+ * assinatura passaram pela mesma liquidez.
+ *
+ * Jupiter roteia POR TAMANHO: uma sonda de US$0,10 pode sair single-hop
+ * enquanto US$500 abre split multi-venue. Sem comparar isso, a diferença
+ * entre os dois drifts mistura efeito de ROTA com efeito de TAMANHO.
+ */
+function routeSignature(quote) {
+  const plan = quote?.routePlan || [];
+  if (plan.length === 0) return null;
+  return plan
+    .map((s) => `${s.swapInfo?.ammKey ?? "?"}@${s.percent ?? "?"}`)
+    .sort()
+    .join("|");
+}
+
+function routeLabel(quote) {
+  const plan = quote?.routePlan || [];
+  if (plan.length === 0) return null;
+  return `[${plan.length}]` + plan.map((s) => s.swapInfo?.label ?? "?").join("+");
+}
+
+/**
  * Emenda 5: lê o routePlan real devolvido pelo roteador.
  * Nada de fixar 0,25% do Raydium — registra venue/fee por salto.
  */
@@ -335,18 +358,30 @@ async function measureQuoteDrift(sizeUsdc) {
 
   let base;
   let baseProbe = null;
+  let baseSizeSig = null;
+  let baseProbeSig = null;
   let baseDoneAt;
   try {
     const t0 = Date.now();
     const q0 = await jupQuote(USDC_MINT, SOL_MINT, inRaw);
     base = Number(q0.outAmount);
+    baseSizeSig = routeSignature(q0);
     result.baseOutAmount = q0.outAmount;
+    result.baseRoute = routeLabel(q0);
     result.baseQuoteAtUtc = new Date(t0).toISOString();
     // Sonda pareada, logo em seguida — a poucos ms da quote de tamanho.
     try {
       const p0 = await jupQuote(USDC_MINT, SOL_MINT, probeRaw);
-      baseProbe = Number(p0.outAmount);
-      result.baseProbeOutAmount = p0.outAmount;
+      const probeHops = (p0.routePlan || []).length;
+      // Sonda degenerada (sem rota ou sem saída) não serve de referência.
+      if (probeHops > 0 && Number(p0.outAmount) > 0) {
+        baseProbe = Number(p0.outAmount);
+        baseProbeSig = routeSignature(p0);
+        result.baseProbeOutAmount = p0.outAmount;
+        result.baseProbeRoute = routeLabel(p0);
+      } else {
+        result.probeDegenerate = true;
+      }
     } catch {
       baseProbe = null;
     }
@@ -368,21 +403,31 @@ async function measureQuoteDrift(sizeUsdc) {
       const recvAt = Date.now();
       const out = Number(q.outAmount);
 
-      // Sonda pareada: mesmo instante, notional desprezível. A diferença
-      // entre os dois drifts é o componente atribuível ao TAMANHO.
+      // Sonda pareada: mesmo instante, notional desprezível.
       let midDriftBps = null;
       let probeOut = null;
+      let probeSig = null;
+      let probeRouteStr = null;
       if (baseProbe != null) {
         try {
           const p = await jupQuote(USDC_MINT, SOL_MINT, probeRaw);
-          probeOut = p.outAmount;
-          midDriftBps = ((Number(p.outAmount) - baseProbe) / baseProbe) * 10_000;
+          if ((p.routePlan || []).length > 0 && Number(p.outAmount) > 0) {
+            probeOut = p.outAmount;
+            probeSig = routeSignature(p);
+            probeRouteStr = routeLabel(p);
+            midDriftBps = ((Number(p.outAmount) - baseProbe) / baseProbe) * 10_000;
+          }
         } catch {
           midDriftBps = null;
         }
       }
 
+      const sizeSig = routeSignature(q);
+      // sizeComponent só é atribuível ao TAMANHO quando as duas quotes
+      // passaram pela MESMA liquidez. Rotas diferentes contaminam a conta.
+      const routeMatch = sizeSig != null && probeSig != null ? sizeSig === probeSig : null;
       const driftBps = ((out - base) / base) * 10_000;
+
       result.points.push({
         nominalHorizonMs: horizon,
         elapsedMsAtRequest: sentAt - baseDoneAt,
@@ -392,6 +437,14 @@ async function measureQuoteDrift(sizeUsdc) {
         probeOutAmount: probeOut,
         midDriftBps,
         sizeComponentBps: midDriftBps != null ? driftBps - midDriftBps : null,
+        routeMatch,
+        sizeRoute: routeLabel(q),
+        probeRoute: probeRouteStr,
+        // Rota que muda entre t0 e t0+horizonte mete descontinuidade de
+        // roteamento dentro do "drift" — não é só movimento de preço.
+        sizeRouteChangedFromBase: baseSizeSig != null && sizeSig != null ? sizeSig !== baseSizeSig : null,
+        probeRouteChangedFromBase:
+          baseProbeSig != null && probeSig != null ? probeSig !== baseProbeSig : null,
         error: null,
       });
     } catch (e) {
@@ -404,6 +457,11 @@ async function measureQuoteDrift(sizeUsdc) {
         probeOutAmount: null,
         midDriftBps: null,
         sizeComponentBps: null,
+        routeMatch: null,
+        sizeRoute: null,
+        probeRoute: null,
+        sizeRouteChangedFromBase: null,
+        probeRouteChangedFromBase: null,
         error: e.message.slice(0, 150),
       });
     }

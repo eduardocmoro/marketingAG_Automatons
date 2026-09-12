@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS quote_drift (
     drift_bps            REAL,
     mid_drift_bps        REAL,   -- sonda de notional desprezível, pareada
     size_component_bps   REAL,   -- drift_bps - mid_drift_bps
+    route_match          INTEGER,-- sonda e quote passaram pela MESMA liquidez
+    size_route           TEXT,
+    probe_route          TEXT,
+    size_route_changed   INTEGER,-- rota mudou entre t0 e t0+horizonte
     error                TEXT
 );
 """
@@ -121,6 +125,10 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
         ("round_trip", "tx_failure_rate", "REAL"),
         ("quote_drift", "mid_drift_bps", "REAL"),
         ("quote_drift", "size_component_bps", "REAL"),
+        ("quote_drift", "route_match", "INTEGER"),
+        ("quote_drift", "size_route", "TEXT"),
+        ("quote_drift", "probe_route", "TEXT"),
+        ("quote_drift", "size_route_changed", "INTEGER"),
     ]:
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
@@ -235,8 +243,10 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                         """INSERT INTO quote_drift
                            (run_id, position_size_usdc, nominal_horizon_ms,
                             elapsed_ms_request, elapsed_ms_response, drift_bps,
-                            mid_drift_bps, size_component_bps, error)
-                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                            mid_drift_bps, size_component_bps,
+                            route_match, size_route, probe_route,
+                            size_route_changed, error)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             run_id,
                             size,
@@ -246,6 +256,11 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                             pt.get("driftBps"),
                             pt.get("midDriftBps"),
                             pt.get("sizeComponentBps"),
+                            None if pt.get("routeMatch") is None else int(pt["routeMatch"]),
+                            pt.get("sizeRoute"),
+                            pt.get("probeRoute"),
+                            None if pt.get("sizeRouteChangedFromBase") is None
+                            else int(pt["sizeRouteChangedFromBase"]),
                             pt.get("error"),
                         ),
                     )
@@ -358,12 +373,34 @@ def calibration_section(conn):
     É este o papel do polling: n pequeno basta para calibrar uma relação.
     A cauda de drift adverso vem de histórico, no Day 2–3.
     """
+    paired = conn.execute(
+        "SELECT COUNT(*) FROM quote_drift "
+        "WHERE drift_bps IS NOT NULL AND mid_drift_bps IS NOT NULL"
+    ).fetchone()[0]
+    mismatched = conn.execute(
+        "SELECT COUNT(*) FROM quote_drift "
+        "WHERE drift_bps IS NOT NULL AND mid_drift_bps IS NOT NULL "
+        "AND route_match = 0"
+    ).fetchone()[0]
+    unknown_route = conn.execute(
+        "SELECT COUNT(*) FROM quote_drift "
+        "WHERE drift_bps IS NOT NULL AND mid_drift_bps IS NOT NULL "
+        "AND route_match IS NULL"
+    ).fetchone()[0]
+    route_changed = conn.execute(
+        "SELECT COUNT(*) FROM quote_drift WHERE size_route_changed = 1"
+    ).fetchone()[0]
+
+    # Jupiter roteia por tamanho: sonda pode sair single-hop e a real abrir
+    # split multi-venue. Nesse caso sizeComponentBps mistura ROTA com TAMANHO
+    # e a observacao nao entra na calibracao.
     rows = list(
         conn.execute(
             """SELECT nominal_horizon_ms, position_size_usdc,
                       drift_bps, mid_drift_bps, size_component_bps
                FROM quote_drift
                WHERE drift_bps IS NOT NULL AND mid_drift_bps IS NOT NULL
+                 AND route_match = 1
                ORDER BY nominal_horizon_ms, position_size_usdc"""
         )
     )
@@ -372,12 +409,28 @@ def calibration_section(conn):
     print("  CALIBRACAO: quote_drift vs sonda de notional despresivel")
     print("  (sonda cotada em par, a poucos ms — isola movimento de preco de tamanho)")
     print("-" * 78)
+    print()
+    print(f"  pares sonda/tamanho: {paired}")
+    print(f"  EXCLUIDOS por rota divergente (route_match=0): {mismatched}")
+    if unknown_route:
+        print(f"  sem info de rota (versao anterior do script): {unknown_route}")
+    if route_changed:
+        print(f"  alerta: {route_changed} quotes mudaram de rota entre t0 e t0+horizonte")
+        print(f"          — nesses pontos o 'drift' carrega descontinuidade de roteamento")
+    if mismatched and paired:
+        print(f"  -> {mismatched/paired*100:.0f}% das observacoes tinham rota diferente entre")
+        print(f"     sonda e tamanho real. sizeComponentBps so e atribuivel ao TAMANHO")
+        print(f"     nas que sobraram.")
+
     if not rows:
-        print("  Sem pares sonda/tamanho nesta base.")
-        print("  Amostras anteriores a esta versao nao trazem a sonda — rode de novo.")
+        print()
+        print("  Nenhum par com rota coincidente — calibracao nao calculada.")
+        print("  Se todos divergem, a sonda de US$0,10 nao representa a liquidez que")
+        print("  os tamanhos reais tocam, e precisa de outro notional.")
         return {}
 
-    out = {}
+    out = {"pairs": paired, "excluded_route_mismatch": mismatched,
+           "unknown_route": unknown_route, "size_route_changed": route_changed}
     print()
     print(f"  {'HORIZ':>7} | {'TAM':>7} | {'n':>4} | {'|DRIFT|':>9} | {'|MID|':>9} | "
           f"{'COMP. TAM':>10} | {'RAZAO':>7}")
@@ -552,13 +605,17 @@ def curve_section(conn, summary, dstats):
         # ── Piso economico do MEV ──
         if attacker_cost:
             print()
-            print("  PISO ECONOMICO DO MEV")
+            print("  LIMIAR DE TRIAGEM DO SEARCHER — ESTIMATIVA MOLE, NAO MEDIDA")
             print("  " + "-" * 68)
-            print(f"    custo do atacante (2 tx, priority p90): ${attacker_cost:.6f}")
+            print("    MEV na Solana opera por bundle com tip leiloado: o tip acompanha")
+            print("    a extracao, entao custo marginal de tx NAO forma piso. O que protege")
+            print("    a posicao pequena e o overhead fixo de triagem do searcher.")
+            print(f"    proxy grosseiro do overhead (2 tx, priority p90): ${attacker_cost:.6f}")
             max_safe_tol = attacker_cost * 10_000 / pos
-            print(f"    TOLERANCIA MAXIMA que mantem US${pos:g} sob o piso: "
-                  f"{max_safe_tol:.0f} bps")
-            print(f"    Acima disso a extracao passa a cobrir o custo do atacante.")
+            print(f"    TOLERANCIA em que US${pos:g} atinge o limiar estimado: "
+                  f"~{max_safe_tol:.0f} bps")
+            print("    ORDEM DE GRANDEZA, nao garantia. Operar com FOLGA GRANDE abaixo,")
+            print("    nunca colado. Confirmacao so com dado real.")
             print()
             print(f"    {'TOL bps':>8} | {'EXTRACAO US$':>13} | {'LIMIAR POSICAO':>15} | {'US$' + format(pos, 'g'):>10}")
             print("    " + "-" * 60)
@@ -568,7 +625,7 @@ def curve_section(conn, summary, dstats):
                 threshold = attacker_cost * 10_000 / tol
                 below = pos < threshold
                 print(f"    {tol:>8} | {extraction:>13.6f} | {threshold:>15.2f} | "
-                      f"{'SOB O PISO' if below else 'exposto':>10}")
+                      f"{'sob limiar' if below else 'exposto':>10}")
 
         rows = []
         for f in floors:
@@ -599,7 +656,7 @@ def curve_section(conn, summary, dstats):
         print("  " + "-" * 58)
         for r in rows:
             mark = "<" if r["p_leg_is_upper_bound"] else " "
-            mev = "sob o piso" if r["position_below_mev_floor"] else "exposto"
+            mev = "sob limiar" if r["position_below_mev_floor"] else "exposto"
             print(f"  {r['tol_bps']:>5} | {r['p_leg']*100:>9.2f}%{mark} | "
                   f"{r['wasted_gas_usdc']:>10.6f} | {r['break_even_pct']:>8.3f}% | {mev:>11}")
 
@@ -612,9 +669,9 @@ def curve_section(conn, summary, dstats):
         if all_below:
             zeroing = next((r for r in rows if r["p_leg_is_upper_bound"]), None)
             print()
-            print(f"  US${pos:g} FICA SOB O PISO ECONOMICO DO MEV EM TODA A GRADE.")
-            print("  Sanduichar essa posicao nao cobre o custo de duas transacoes do")
-            print("  atacante mais a corrida de priority fee. O braco direito nao fecha,")
+            print(f"  US${pos:g} fica sob o limiar ESTIMADO de triagem em toda a grade.")
+            print("  Estimativa, nao medicao: o tip leiloado acompanha a extracao, entao")
+            print("  o que segura o ataque e a triagem do searcher, nao aritmetica. Sob ela")
             print("  a curva e MONOTONICAMENTE DECRESCENTE e nao existe minimo interno.")
             print()
             if zeroing:
@@ -623,8 +680,8 @@ def curve_section(conn, summary, dstats):
             else:
                 print("  Nenhuma tolerancia da grade zerou reversao na amostra.")
             print()
-            print("  Esta e uma VANTAGEM ESTRUTURAL da microposicao, nao um achado")
-            print("  de estrategia: o desenho opera abaixo do piso economico do MEV.")
+            print("  Vantagem PROVAVEL da microposicao — a confirmar na Fase 2 com")
+            print("  execucao real. Nao tratar como protecao garantida.")
         elif rows:
             best = min(rows, key=lambda r: r["break_even_with_sandwich_pct"])
             print()
@@ -635,8 +692,10 @@ def curve_section(conn, summary, dstats):
             "n_raw": n,
             "n_effective": n_eff,
             "rho_lag1": rho,
-            "attacker_cost_usdc": attacker_cost,
-            "max_safe_tolerance_bps": (attacker_cost * 10_000 / pos) if attacker_cost else None,
+            "tolerance_at_triage_threshold_bps_UNMEASURED":
+                (attacker_cost * 10_000 / pos) if attacker_cost else None,
+            "searcher_overhead_proxy_usdc": attacker_cost,
+            "mev_estimate_measured": False,
             "all_below_mev_floor": bool(all_below),
             "preliminary": True,
         }

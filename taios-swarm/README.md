@@ -184,33 +184,31 @@ A curva tem dois braços:
 - **direito** (tolerância larga) → sandwich. Resolvido por **economia do
   atacante**, não por medição de MEV.
 
-#### Vantagem estrutural da microposição
+#### Limiar de triagem do searcher — estimativa mole, NÃO medida
 
-O braço direito não precisa de medição de sandwich: resolve-se pela aritmética do
-atacante. Sanduichar exige **duas transações** e ganhar uma **corrida de priority
-fee**. A extração é `posição × tolerância`. Logo:
+**Não existe piso econômico por custo marginal de transação.** MEV na Solana opera
+por bundle com **tip leiloado competitivamente**: o tip acompanha a extração, então
+o custo do atacante sobe junto com o ganho e não forma piso fixo. Um searcher pode
+dar lance em praticamente qualquer extração positiva.
+
+O que de fato protege a posição pequena é o **limiar de triagem**: overhead fixo
+por tentativa (infra, simulação, monitoramento) e o filtro de lucro mínimo que o
+searcher aplica antes de olhar o alvo. Isso é **política de operação de terceiro,
+não aritmética**, e não foi medido aqui.
 
 ```
-custo do atacante = 2 × (base_fee × sigs + cu_price_corrida × cu)
-limiar(tol)       = custo_do_atacante × 10000 / tol
-tolerância máxima segura = custo_do_atacante × 10000 / posição
+extração(pos, tol) = pos × tol/10000
+limiar(tol)        ≈ overhead_de_triagem × 10000 / tol
 ```
 
-Em posição de US$1 com tolerância de 50 bps a extração é US$0,005 — o atacante
-paga duas transações por isso e **não fecha**. O desenho opera **abaixo do piso
-econômico do MEV**, e isso é vantagem estrutural da microposição, não achado de
-estratégia.
+`mevTriageEstimate()` em `src/costs/model.ts` usa 2× a taxa de uma tx de swap
+apenas como **proxy grosseiro** desse overhead. O overhead real é provavelmente
+maior (infra e capital não aparecem numa taxa de rede), mas pode ser menor para
+quem já roda a infra para outros alvos. O campo carrega `measured: false` e o JSON
+nomeia o número `tolerance_at_triage_threshold_bps_UNMEASURED`.
 
-O relatório reporta a **tolerância máxima que mantém a posição sob o piso**. Esse
-é o número operacional: abaixo dele a curva é monotonicamente decrescente e o que
-importa é a menor tolerância que zera reversão, não um mínimo interno.
-
-Premissas e direção do viés (em `mevEconomicFloor`, `src/costs/model.ts`): assumir
-extração total superestima o ganho do atacante e ignorar custo de capital,
-inventário e falha do próprio ataque subestima seu custo — ambos empurram o limiar
-para **baixo**, então tratar a faixa como segura só quando ela estiver
-confortavelmente abaixo. Bundles Jito trocam a corrida por tip: o custo muda de
-forma, não some.
+**Uso correto:** ordem de grandeza, operando com **folga grande** sob o limiar,
+nunca colado nele. Confirmação só com dado real na Fase 2.
 
 #### Resolução de cauda: n bruto vs n efetivo
 
@@ -242,6 +240,26 @@ coleta isso.
 | histórico (Day 2–3) | grande | distribuição de cauda e `revert_rate_floor` definitivo |
 
 Por isso a curva do Day 1 sai marcada **PRELIMINAR** e **não bloqueia nada**.
+
+#### A sonda só vale com rota coincidente
+
+Jupiter **roteia por tamanho**: uma sonda de US$0,10 pode sair single-hop enquanto
+US$500 abre split multi-venue. Quando isso acontece, `sizeComponentBps` mistura
+efeito de **rota** com efeito de **tamanho** e não mede nada.
+
+A medição registra a assinatura de rota (pools concretos + split) das duas quotes
+e grava `routeMatch`. A calibração **exclui** as observações com rota divergente e
+o relatório informa quantas foram excluídas e em que proporção. Sonda degenerada
+(sem rota ou sem saída) é descartada na origem.
+
+Também é registrado `sizeRouteChangedFromBase`: quando a rota da própria quote de
+tamanho muda entre `t0` e `t0+horizonte`, o "drift" daquele ponto carrega uma
+descontinuidade de roteamento, não só movimento de preço. O relatório conta esses
+casos separadamente.
+
+Se a maioria das observações divergir, a sonda de US$0,10 não representa a liquidez
+que os tamanhos reais tocam e precisa de outro notional — o relatório diz isso em
+vez de calcular uma calibração inválida.
 
 ### `slippageBps` é parâmetro evoluído, não constante
 
