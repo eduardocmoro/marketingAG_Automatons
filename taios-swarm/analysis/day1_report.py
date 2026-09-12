@@ -49,6 +49,12 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS run (
     run_id              INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp_utc       TEXT NOT NULL,
+    complete            INTEGER,
+    rate_limit_hits     INTEGER,
+    rent_matches_formula INTEGER,
+    rent_formula_lamports INTEGER,
+    cu_price_global_median REAL,
+    cu_price_global_p90 REAL,
     rpc_url             TEXT,
     jupiter_host        TEXT,
     sol_usdc_price      REAL,
@@ -80,6 +86,11 @@ CREATE TABLE IF NOT EXISTS round_trip (
     net_lamports_p90        INTEGER,
     cu_consumed_source      TEXT,
     tx_failure_rate         REAL,   -- FASE 2 apenas; null no paper
+    round_trip_return_pct   REAL,   -- <0 perda, >0 ganho
+    leg_gap_ms              INTEGER,-- tempo entre as duas quotes
+    fee_routeplan_usdc      REAL,   -- soma de feeAmount das duas pernas
+    fee_routeplan_pct       REAL,
+    fee_discrepancy_usdc    REAL,   -- observado - routePlan
     error                   TEXT
 );
 
@@ -116,6 +127,11 @@ MIN_DRIFT_SAMPLES = 30
 # Posição central da tese — a curva é desenhada em detalhe para ela.
 THESIS_POSITION_USDC = 1.0
 
+# Piso físico de taxa: o tier CLMM mais barato que existe em pool relevante
+# é 0,01% por swap = 0,02% no round trip. Perda medida abaixo disso significa
+# que a taxa de pool NAO entrou na conta.
+CHEAPEST_POOL_ROUND_TRIP_PCT = 0.02
+
 
 def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -125,6 +141,17 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
         ("round_trip", "tx_failure_rate", "REAL"),
         ("quote_drift", "mid_drift_bps", "REAL"),
         ("quote_drift", "size_component_bps", "REAL"),
+        ("round_trip", "round_trip_return_pct", "REAL"),
+        ("round_trip", "leg_gap_ms", "INTEGER"),
+        ("round_trip", "fee_routeplan_usdc", "REAL"),
+        ("round_trip", "fee_routeplan_pct", "REAL"),
+        ("round_trip", "fee_discrepancy_usdc", "REAL"),
+        ("run", "complete", "INTEGER"),
+        ("run", "rate_limit_hits", "INTEGER"),
+        ("run", "rent_matches_formula", "INTEGER"),
+        ("run", "rent_formula_lamports", "INTEGER"),
+        ("run", "cu_price_global_median", "REAL"),
+        ("run", "cu_price_global_p90", "REAL"),
         ("quote_drift", "route_match", "INTEGER"),
         ("quote_drift", "size_route", "TEXT"),
         ("quote_drift", "probe_route", "TEXT"),
@@ -158,8 +185,11 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                 """INSERT OR IGNORE INTO run
                    (timestamp_utc, rpc_url, jupiter_host, sol_usdc_price,
                     base_fee_per_sig, cu_price_median, cu_price_p90,
-                    cu_price_samples, ata_rent_lamports)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                    cu_price_samples, ata_rent_lamports,
+                    complete, rate_limit_hits, rent_matches_formula,
+                    rent_formula_lamports, cu_price_global_median,
+                    cu_price_global_p90)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     rec.get("timestampUtc"),
                     rec.get("rpcUrl"),
@@ -170,6 +200,12 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                     scoped.get("p90"),
                     scoped.get("samples"),
                     (rec.get("ataRent") or {}).get("lamportsPerAccount"),
+                    (rec.get("completeness") or {}).get("complete"),
+                    len(rec.get("rateLimitEvents") or []),
+                    (rec.get("ataRent") or {}).get("matchesFormula"),
+                    (rec.get("ataRent") or {}).get("formulaLamports"),
+                    ((rec.get("priorityFee") or {}).get("global") or {}).get("median"),
+                    ((rec.get("priorityFee") or {}).get("global") or {}).get("p90"),
                 ),
             )
             if cur.rowcount == 0:
@@ -203,8 +239,11 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                         leg1_realized_slip_pct, leg2_realized_slip_pct,
                         leg1_hops, leg2_hops, leg1_venues, leg2_venues,
                         net_lamports_median, net_lamports_p90,
-                        cu_consumed_source, tx_failure_rate, error)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        cu_consumed_source, tx_failure_rate,
+                        round_trip_return_pct, leg_gap_ms,
+                        fee_routeplan_usdc, fee_routeplan_pct,
+                        fee_discrepancy_usdc, error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         run_id,
                         rt.get("positionSizeUsdc"),
@@ -224,6 +263,11 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                         (l1p + l2p) if (l1p is not None and l2p is not None) else None,
                         (leg1.get("compute") or {}).get("cuConsumedSource"),
                         rt.get("txFailureRate"),  # null na Fase 1, por construção
+                        rt.get("roundTripReturnPct"),
+                        rt.get("legGapMs"),
+                        (rt.get("feeCrossCheck") or {}).get("totalFeeUsdc"),
+                        (rt.get("feeCrossCheck") or {}).get("totalFeePctOfPosition"),
+                        (rt.get("feeCrossCheck") or {}).get("discrepancyUsdc"),
                         rt.get("error"),
                     ),
                 )
@@ -287,6 +331,170 @@ def pct(values, p):
 
 def fmt(v, nd=4, dash="—"):
     return dash if v is None else f"{v:.{nd}f}"
+
+
+def integrity_section(conn):
+    """
+    Checagem de integridade da medição, ANTES de qualquer leitura de custo.
+
+    Três testes que um resultado válido tem que passar:
+      1. Monotonicidade — price impact cresce com o tamanho. Se US$500 sai
+         melhor que US$0,50 no mesmo pool, a medição está errada.
+      2. Piso físico — perda de round trip abaixo de 0,02% significa que a
+         taxa de pool não entrou na conta.
+      3. Validação cruzada — a soma de feeAmount do routePlan das duas pernas
+         tem que explicar a perda observada. Caminho independente do
+         encadeamento de quotes: se não bater, o bug é do nosso cálculo.
+    """
+    print()
+    print("=" * 78)
+    print("  INTEGRIDADE DA MEDICAO")
+    print("=" * 78)
+
+    verdicts = {"monotonic": None, "above_floor": None, "fee_crosscheck": None}
+
+    # ── Completude e rate limit ──
+    incomplete = conn.execute(
+        "SELECT COUNT(*) FROM run WHERE complete = 0"
+    ).fetchone()[0]
+    hits = conn.execute(
+        "SELECT COALESCE(SUM(rate_limit_hits),0) FROM run"
+    ).fetchone()[0]
+    total_runs = conn.execute("SELECT COUNT(*) FROM run").fetchone()[0]
+    if incomplete or hits:
+        print()
+        print(f"  [!] {incomplete}/{total_runs} execucao(oes) incompleta(s), "
+              f"{hits} bloqueio(s) 429 da Jupiter.")
+        print("      Suba o espacamento: JUP_MIN_GAP_MS=2000")
+
+    # ── Rent: medido vs formula ──
+    for measured, formula, matches in conn.execute(
+        "SELECT ata_rent_lamports, rent_formula_lamports, rent_matches_formula "
+        "FROM run WHERE ata_rent_lamports IS NOT NULL LIMIT 1"
+    ):
+        print()
+        print("  RENT DE ATA")
+        print(f"    medido  : {measured:,} lamports")
+        if formula:
+            print(f"    formula : {formula:,} lamports  ((128+165) x 3480 x 2)")
+            if matches == 0:
+                print(f"    [!] DIVERGE em {abs(measured-formula):,} lamports "
+                      f"({(measured/formula-1)*100:+.1f}%)")
+                print("        O relatorio usa o MEDIDO. Ver sondas de 0 e 82 bytes no")
+                print("        jsonl para diagnosticar o schedule de rent do RPC.")
+
+    # ── Priority fee: global vs filtrado por pool ──
+    for gm, gp, fm, fp in conn.execute(
+        "SELECT cu_price_global_median, cu_price_global_p90, "
+        "cu_price_median, cu_price_p90 FROM run "
+        "WHERE cu_price_median IS NOT NULL LIMIT 1"
+    ):
+        print()
+        print("  PRIORITY FEE (micro-lamports/CU)")
+        print(f"    global (rede inteira) : mediana {gm} | p90 {gp}")
+        print(f"    filtrado por pool     : mediana {fm} | p90 {fp}")
+        if gm and gp and gm > 0 and gp / gm > 50:
+            print(f"    [!] spread global de {gp/gm:.0f}x — o global e ruido da rede,")
+            print("        nao a taxa relevante. Use a linha filtrada por pool.")
+
+    # ── Teste 1: monotonicidade ──
+    rows = conn.execute(
+        "SELECT position_size_usdc, AVG(swap_loss_pct), COUNT(*) "
+        "FROM round_trip WHERE error IS NULL AND swap_loss_pct IS NOT NULL "
+        "GROUP BY position_size_usdc ORDER BY position_size_usdc"
+    ).fetchall()
+    print()
+    print("  TESTE 1 — MONOTONICIDADE (impacto tem que crescer com o tamanho)")
+    print("  " + "-" * 68)
+    if len(rows) < 2:
+        print("    amostras insuficientes")
+    else:
+        print(f"    {'TAMANHO':>9} | {'PERDA MEDIA %':>14} | {'n':>4}")
+        prev = None
+        violations = []
+        for size, loss, n in rows:
+            flag = ""
+            if prev is not None and loss < prev[1] - 1e-9:
+                flag = f"  <-- MENOR que ${prev[0]:g}"
+                violations.append((prev[0], size))
+            print(f"    {'$' + format(size, 'g'):>9} | {loss:>14.4f} | {n:>4}{flag}")
+            prev = (size, loss)
+        verdicts["monotonic"] = not violations
+        if violations:
+            print()
+            print(f"    [FALHOU] {len(violations)} violacao(oes). Impacto de preco nao pode")
+            print("             diminuir com o tamanho no mesmo pool.")
+        else:
+            print()
+            print("    [OK] perda cresce monotonicamente com o tamanho.")
+
+    # ── Teste 2: piso fisico ──
+    print()
+    print(f"  TESTE 2 — PISO FISICO (perda >= {CHEAPEST_POOL_ROUND_TRIP_PCT}% no round trip)")
+    print("  " + "-" * 68)
+    below = [(sz, l) for sz, l, _ in rows if l < CHEAPEST_POOL_ROUND_TRIP_PCT]
+    if not rows:
+        print("    sem amostras")
+    elif below:
+        verdicts["above_floor"] = False
+        print(f"    [FALHOU] {len(below)}/{len(rows)} tamanhos abaixo do pool mais barato")
+        print(f"             que existe (tier CLMM 0,01% = {CHEAPEST_POOL_ROUND_TRIP_PCT}% ida e volta).")
+        for sz, l in below[:5]:
+            print(f"               ${sz:g}: {l:.4f}%  ({CHEAPEST_POOL_ROUND_TRIP_PCT/l:.0f}x abaixo)"
+                  if l > 0 else f"               ${sz:g}: {l:.4f}%  (nao-positivo)")
+        print("             A taxa de pool NAO esta entrando no calculo.")
+    else:
+        verdicts["above_floor"] = True
+        print("    [OK] todos os tamanhos acima do piso fisico.")
+
+    # ── Teste 3: validacao cruzada por feeAmount ──
+    print()
+    print("  TESTE 3 — VALIDACAO CRUZADA (perda observada vs feeAmount do routePlan)")
+    print("  " + "-" * 68)
+    cross = conn.execute(
+        "SELECT position_size_usdc, AVG(swap_loss_pct), AVG(fee_routeplan_pct), "
+        "       AVG(fee_discrepancy_usdc), AVG(leg_gap_ms), COUNT(*) "
+        "FROM round_trip WHERE error IS NULL AND fee_routeplan_pct IS NOT NULL "
+        "GROUP BY position_size_usdc ORDER BY position_size_usdc"
+    ).fetchall()
+    if not cross:
+        print("    Sem dados de routePlan fee — amostra de versao anterior do script.")
+        print("    Rode a medicao atualizada: so ela grava feeCrossCheck.")
+    else:
+        print(f"    {'TAM':>7} | {'OBSERVADO %':>12} | {'routePlan %':>12} | "
+              f"{'DIFF US$':>11} | {'gap ms':>7}")
+        bad = 0
+        for size, obs, fee, disc, gap, n in cross:
+            # Observado deve ser >= taxa de pool (impacto so soma).
+            suspect = obs < fee - 1e-9
+            flag = "  <-- ABAIXO da taxa" if suspect else ""
+            if suspect:
+                bad += 1
+            print(f"    {'$' + format(size, 'g'):>7} | {obs:>12.4f} | {fee:>12.4f} | "
+                  f"{disc:>11.6f} | {gap or 0:>7.0f}{flag}")
+        verdicts["fee_crosscheck"] = bad == 0
+        print()
+        if bad:
+            print(f"    [FALHOU] {bad} tamanho(s) com perda observada MENOR que a taxa")
+            print("             que o proprio roteador diz ter cobrado. Isso e")
+            print("             impossivel fisicamente — o bug esta no encadeamento.")
+        else:
+            print("    [OK] perda observada cobre a taxa do routePlan em todos os tamanhos.")
+            print("         A diferenca e price impact mais deriva entre as pernas (gap ms).")
+
+    # ── Veredito ──
+    print()
+    print("  " + "=" * 68)
+    failed = [k for k, v in verdicts.items() if v is False]
+    if failed:
+        print(f"  VEREDITO: MEDICAO INVALIDA — falhou em {', '.join(failed)}.")
+        print("  Nao use os numeros de custo abaixo para decidir nada.")
+    elif all(v is None for v in verdicts.values()):
+        print("  VEREDITO: sem dados suficientes para checar integridade.")
+    else:
+        print("  VEREDITO: medicao passou nos testes de integridade disponiveis.")
+    print("  " + "=" * 68)
+    return verdicts
 
 
 def drift_stats(conn, size=None):
@@ -799,6 +1007,8 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
         print("=" * 78)
         return
 
+    integrity = integrity_section(conn)
+
     prices = [
         r[0] for r in conn.execute("SELECT sol_usdc_price FROM run WHERE sol_usdc_price IS NOT NULL")
     ]
@@ -1060,6 +1270,7 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
             {
                 "summary": summary,
                 "sol_usdc_price_measured": sol_price,
+                "integrity": integrity,
                 "coverage": {
                     "windows": len(cov["windows"]),
                     "span_hours": cov["span_hours"],

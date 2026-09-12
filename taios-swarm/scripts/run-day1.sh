@@ -22,6 +22,9 @@
 #   SOLANA_RPC_URL   RPC dedicado (Helius/QuickNode/Alchemy). O público
 #                    (api.mainnet-beta.solana.com) é rate-limited e costuma
 #                    recusar simulateTransaction.
+#                    A URL nunca é impressa nem gravada por inteiro.
+#   JUP_MIN_GAP_MS   espaçamento entre chamadas Jupiter (padrão 1200).
+#                    Suba para 2000+ se aparecer 429.
 #   MEASURE_PUBKEY   conta pública usada só para simular e obter unitsConsumed
 # ==============================================================================
 
@@ -45,7 +48,14 @@ fi
 echo "TAIOS-Swarm — Day 1"
 echo "Amostras : $SAMPLES"
 echo "Intervalo: ${INTERVAL}s"
-echo "RPC      : ${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com (público)}"
+# Nunca imprimir a URL completa: RPC dedicado carrega a API key nela.
+if [ -n "${SOLANA_RPC_URL:-}" ]; then
+    RPC_HOST="$(printf '%s' "$SOLANA_RPC_URL" | sed -E 's#^(https?://[^/?]+).*#\1#')"
+    RPC_TAIL="$(printf '%s' "$SOLANA_RPC_URL" | tail -c 5)"
+    echo "RPC      : ${RPC_HOST}/…${RPC_TAIL}"
+else
+    echo "RPC      : https://api.mainnet-beta.solana.com (público)"
+fi
 echo ""
 
 if [ -z "${SOLANA_RPC_URL:-}" ]; then

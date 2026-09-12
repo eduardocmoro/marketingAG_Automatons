@@ -276,6 +276,35 @@ Round trip é medido de ponta a ponta: entra com N USDC, a perna 2 usa exatament
 o `outAmount` da perna 1, sai com M USDC. `swapLoss = N − M` captura fee de pool e
 price impact das duas direções sem modelar cada pool à mão.
 
+### Integridade antes de leitura
+
+O relatório roda três testes ANTES de qualquer número de custo, e bloqueia a
+leitura se algum falhar:
+
+1. **Monotonicidade** — impacto de preço tem que crescer com o tamanho. US$500
+   sair melhor que US$0,50 no mesmo pool é fisicamente impossível.
+2. **Piso físico** — perda de round trip abaixo de **0,02%** (tier CLMM mais
+   barato que existe, 0,01% por swap) significa que a taxa de pool não entrou
+   no cálculo.
+3. **Validação cruzada** — a soma de `feeAmount` do `routePlan` das duas pernas
+   tem que ser coberta pela perda observada. É um caminho **independente** do
+   encadeamento de quotes: se a perda observada for menor que a taxa que o
+   próprio roteador diz ter cobrado, o bug está no nosso cálculo.
+
+As duas quotes do round trip são disparadas **coladas no tempo**, e `legGapMs`
+registra o intervalo. Construir a tx de swap e simular entre as pernas metia
+0,5–2s de deriva de preço dentro da medição.
+
+**Convenção de sinal, explícita:** `roundTripReturnPct < 0` é perda,
+`swapLossPct > 0` é perda. Um é o negativo do outro.
+
+### Segurança da chave de RPC
+
+A `SOLANA_RPC_URL` de um RPC dedicado carrega a API key. Ela **nunca** é
+impressa no stdout nem gravada no `jsonl` — só host e os 4 últimos caracteres.
+O `jsonl` é commitado como trilha de auditoria, então a chave completa ali
+seria vazamento permanente no histórico do git.
+
 ### Rodar
 
 ```bash
@@ -286,7 +315,17 @@ export SOLANA_RPC_URL='https://mainnet.helius-rpc.com/?api-key=SUA_CHAVE'
 
 bash scripts/run-day1.sh            # 1 amostra + relatório
 bash scripts/run-day1.sh 8 300      # 1 bloco: 8 amostras a cada 5 min
+
+# se aparecer 429 da Jupiter, aumente o espaçamento
+JUP_MIN_GAP_MS=2000 bash scripts/run-day1.sh 8 300
 ```
+
+O free tier da Jupiter (`lite-api`) derruba com 429. O script aplica throttle
+global (padrão 1200ms entre chamadas) e backoff exponencial, registra **toda**
+ocorrência de 429 em `rateLimitEvents`, e marca a amostra como incompleta —
+**dado parcial nunca sai silencioso**. O drift roda sem throttle interno para
+não destruir os horizontes, compensando com folga entre tamanhos, e mede apenas
+os 4 tamanhos do núcleo (é movimento de preço, quase independente do tamanho).
 
 **Um bloco não fecha o Day 1.** Oito amostras seguidas cobrem ~40 minutos: um
 único regime de congestionamento. O mínimo é **3 blocos em horários distintos ao
