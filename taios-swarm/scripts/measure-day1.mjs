@@ -21,6 +21,7 @@
  */
 
 import { appendFileSync, mkdirSync } from "fs";
+import { execSync } from "child_process";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
@@ -58,6 +59,24 @@ const DRIFT_SIZES_USDC = [0.5, 1, 2, 5];
 // Intervalo maximo aceitavel entre as duas quotes do round trip. Acima
 // disto a deriva de preco compete com o custo medido e a amostra nao serve.
 const MAX_LEG_GAP_MS = 300;
+
+/**
+ * SHA do codigo que produziu esta amostra.
+ *
+ * O jsonl e append-only e acumula versoes do script ao longo dos dias. Sem
+ * isto, a analise agrega medicao de versoes com semantica diferente — dado
+ * velho envenenando dado novo.
+ */
+function gitSha() {
+  try {
+    return execSync("git rev-parse --short HEAD", {
+      cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+const GIT_SHA = gitSha();
 
 const RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 
@@ -401,6 +420,7 @@ async function measurePriorityFeeDistribution(poolAccounts = []) {
     const global = await rpc("getRecentPrioritizationFees", [[]]);
     const fees = global.map((f) => f.prioritizationFee).sort((a, b) => a - b);
     out.global = {
+      ...feeShape(fees),
       samples: fees.length,
       median: percentile(fees, 0.5),
       p25: percentile(fees, 0.25),
@@ -429,6 +449,7 @@ async function measurePriorityFeeDistribution(poolAccounts = []) {
     // filtro por ammKey, o custo em US$1 varia de forma imprevisivel e
     // nenhum alvo fixo de lucro por trade se sustenta.
     out.solUsdc = {
+      ...feeShape(fees),
       samples: fees.length,
       median: percentile(fees, 0.5),
       p25: percentile(fees, 0.25),
@@ -443,6 +464,28 @@ async function measurePriorityFeeDistribution(poolAccounts = []) {
     out.error = (out.error ? out.error + " | " : "") + e.message.slice(0, 200);
   }
   return out;
+}
+
+/**
+ * Forma da distribuicao, para detectar cap ou saturacao na coleta.
+ *
+ * Percentil redondo demais (ex.: 1.500.000 exato) e suspeito de teto, nao
+ * de observacao. Se muitas amostras empatam no maximo, a cauda esta
+ * saturada e os percentis altos nao sao empiricos.
+ */
+function feeShape(sortedFees) {
+  if (sortedFees.length === 0) return { distinctValues: 0, maxCount: 0, topValues: [] };
+  const counts = new Map();
+  for (const f of sortedFees) counts.set(f, (counts.get(f) ?? 0) + 1);
+  const max = sortedFees[sortedFees.length - 1];
+  return {
+    distinctValues: counts.size,
+    maxCount: counts.get(max) ?? 0,
+    topValues: [...counts.entries()]
+      .sort((a, b) => b[0] - a[0])
+      .slice(0, 5)
+      .map(([value, count]) => ({ value, count })),
+  };
 }
 
 function networkFeeLamports(signatures, cuPriceMicroLamports, cuConsumed) {
@@ -796,6 +839,7 @@ async function main() {
   console.log(`Tamanhos : ${TRADE_SIZES_USDC.map((s) => "$" + s).join(", ")}`);
   console.log(`Drift em : ${DRIFT_SIZES_USDC.map((s) => "$" + s).join(", ")}`);
   console.log(`Throttle : ${JUP_MIN_GAP_MS}ms entre chamadas Jupiter`);
+  console.log(`Codigo   : schema v3 | git ${GIT_SHA ?? "desconhecido"}`);
   console.log("");
 
   // [1] Preço primeiro: a validação cruzada de taxas precisa dele para
@@ -906,7 +950,8 @@ async function main() {
   };
 
   const record = {
-    schemaVersion: 2,
+    schemaVersion: 3,
+    gitSha: GIT_SHA,
     timestampUtc: startedAt,
     finishedUtc: new Date().toISOString(),
     rpcUrl: RPC_URL_MASKED, // mascarado: o jsonl é commitado

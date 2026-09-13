@@ -367,13 +367,49 @@ p90. **Um desenho que só fecha na coluna mediana não fecha em congestionamento
 
 #### Priority fee: usar sempre a filtrada por pool
 
-Medido: **global mediana 0 / p90 0**, mas **filtrada por pool mediana 0 / p90
-128.050**. Os pools estão disputados mesmo com a rede calma — passar os mints não
-filtrava nada e o p90 global de 170.893 da primeira rodada era **ruído de outras
-contas**.
+Medido em 21 execuções: **global p50/p90 = 0 / 0**, mas **filtrada por `ammKey`
+p50 = 317.255**.
+
+> Os pools de SOL/USDC estão entre as contas mais disputadas da rede **mesmo com
+> a rede inteira calma**. Isso valida o filtro por `ammKey` e **invalida qualquer
+> uso do global**.
 
 O break-even usa **sempre a filtrada**. A global fica no relatório só como
-referência de contraste.
+contraste — e o contraste é o achado.
+
+#### Detecção de cap na coleta
+
+Percentil redondo demais é suspeito de teto, não de observação. O script grava a
+forma da distribuição (valores distintos, empates no máximo, 5 valores de topo
+com contagem) e o relatório alerta quando:
+
+- mais de 10% das amostras empatam no valor máximo → assinatura de saturação
+- p90/p99 é múltiplo exato de 100.000 → redondo demais para ser empírico
+
+Sem isso, um teto na coleta entraria no break-even como se fosse cauda real.
+
+### Segmentação por versão do código
+
+O `jsonl` é append-only e acumula versões do script ao longo dos dias. Versões
+diferentes **medem coisas diferentes** — a correção do gap entre pernas (schema
+v3) mudou a semântica do round trip, e agregar v2 com v3 faz **dado velho
+envenenar dado novo**.
+
+Cada amostra grava `schemaVersion` e `gitSha`. O relatório segmenta e usa **só a
+versão mais recente** para round trip, TESTE 0 e TESTE 4, reportando quantas
+amostras ficaram de fora. As antigas permanecem no `jsonl` como histórico.
+
+**A contaminação de gap é derivada do próprio `legGapMs`**, nunca do campo
+gravado pelo script — amostras de versões anteriores não têm esse campo, e
+tratá-las como limpas produzia contagem incoerente com a média.
+
+#### Proveniência do `cu_consumed`
+
+Toda a tabela de break-even depende desse número. O relatório reporta a fração de
+amostras por `cuConsumedSource` e alerta quando **nenhuma** veio de
+`simulateTransaction` — o RPC público recusa simulação, e nesse caso tudo é
+estimativa do roteador. Se as duas fontes coexistirem e divergirem mais de 10%, o
+relatório avisa que o break-even muda conforme a fonte.
 
 ### Decisão de desenho: abstenção por priority fee
 

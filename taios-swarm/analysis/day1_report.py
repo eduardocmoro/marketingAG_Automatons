@@ -49,6 +49,11 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS run (
     run_id              INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp_utc       TEXT NOT NULL,
+    schema_version      INTEGER,
+    git_sha             TEXT,
+    fee_distinct_values INTEGER,
+    fee_max_count       INTEGER,
+    fee_top_values      TEXT,
     complete            INTEGER,
     rate_limit_hits     INTEGER,
     rent_matches_formula INTEGER,
@@ -192,6 +197,11 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
         ("round_trip", "leg1_signatures", "INTEGER"),
         ("round_trip", "leg2_signatures", "INTEGER"),
         ("round_trip", "leg_gap_contaminated", "INTEGER"),
+        ("run", "schema_version", "INTEGER"),
+        ("run", "git_sha", "TEXT"),
+        ("run", "fee_distinct_values", "INTEGER"),
+        ("run", "fee_max_count", "INTEGER"),
+        ("run", "fee_top_values", "TEXT"),
         ("quote_drift", "route_match", "INTEGER"),
         ("quote_drift", "size_route", "TEXT"),
         ("quote_drift", "probe_route", "TEXT"),
@@ -228,8 +238,10 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                     cu_price_samples, ata_rent_lamports,
                     complete, rate_limit_hits, rent_matches_formula,
                     rent_formula_lamports, cu_price_global_median,
-                    cu_price_global_p90, cu_price_p25, cu_price_p75, cu_price_p99)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    cu_price_global_p90, cu_price_p25, cu_price_p75, cu_price_p99,
+                    schema_version, git_sha, fee_distinct_values,
+                    fee_max_count, fee_top_values)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     rec.get("timestampUtc"),
                     rec.get("rpcUrl"),
@@ -249,6 +261,11 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                     scoped.get("p25"),
                     scoped.get("p75"),
                     scoped.get("p99"),
+                    rec.get("schemaVersion"),
+                    rec.get("gitSha"),
+                    scoped.get("distinctValues"),
+                    scoped.get("maxCount"),
+                    json.dumps(scoped.get("topValues")) if scoped.get("topValues") else None,
                 ),
             )
             if cur.rowcount == 0:
@@ -411,6 +428,61 @@ def fmt(v, nd=4, dash="—"):
     return dash if v is None else f"{v:.{nd}f}"
 
 
+def build_cohort(conn):
+    """
+    Segmenta por versao do codigo e expoe so a mais recente para analise.
+
+    O jsonl e append-only e acumula versoes do script ao longo dos dias. A
+    correcao do gap entre pernas (schema v3) mudou o que o round trip mede —
+    agregar v2 e v3 junto faz dado velho envenenar dado novo. Amostras sem
+    schema_version sao tratadas como versao 0 (pre-instrumentacao).
+    """
+    versions = conn.execute(
+        "SELECT COALESCE(schema_version, 0) AS v, COUNT(*), "
+        "       GROUP_CONCAT(DISTINCT COALESCE(git_sha,'?')) "
+        "FROM run GROUP BY v ORDER BY v DESC"
+    ).fetchall()
+    latest = versions[0][0] if versions else 0
+
+    for view, table in [("round_trip_cohort", "round_trip"),
+                        ("quote_drift_cohort", "quote_drift"),
+                        ("route_hop_cohort", "route_hop")]:
+        conn.execute(f"DROP VIEW IF EXISTS {view}")
+        conn.execute(
+            f"CREATE TEMP VIEW {view} AS SELECT * FROM {table} WHERE run_id IN "
+            f"(SELECT run_id FROM run WHERE COALESCE(schema_version,0) = {latest})"
+        )
+
+    total_rt = conn.execute("SELECT COUNT(*) FROM round_trip").fetchone()[0]
+    kept_rt = conn.execute("SELECT COUNT(*) FROM round_trip_cohort").fetchone()[0]
+    total_qd = conn.execute("SELECT COUNT(*) FROM quote_drift").fetchone()[0]
+    kept_qd = conn.execute("SELECT COUNT(*) FROM quote_drift_cohort").fetchone()[0]
+
+    print()
+    print("=" * 78)
+    print("  COORTE DE ANALISE — SEGMENTADA POR VERSAO DO CODIGO")
+    print("=" * 78)
+    print()
+    print(f"    {'SCHEMA':>7} | {'EXECUCOES':>10} | {'':>4} | git sha")
+    print("    " + "-" * 60)
+    for v, n, shas in versions:
+        mark = "USA" if v == latest else "excl"
+        print(f"    {('v' + str(v)) if v else 'pre':>7} | {n:>10} | {mark:>4} | {shas or '?'}")
+    print()
+    print(f"    round trip : {kept_rt}/{total_rt} amostras na coorte "
+          f"({total_rt - kept_rt} excluidas)")
+    print(f"    drift      : {kept_qd}/{total_qd} amostras na coorte "
+          f"({total_qd - kept_qd} excluidas)")
+    if total_rt - kept_rt > 0:
+        print()
+        print("    Versoes anteriores medem coisa diferente e NAO entram nas tabelas")
+        print("    de custo, TESTE 0 e TESTE 4. Continuam no jsonl como historico.")
+    return {"latest_schema": latest,
+            "versions": [{"schema": v, "runs": n, "git_sha": shas} for v, n, shas in versions],
+            "round_trip_kept": kept_rt, "round_trip_total": total_rt,
+            "drift_kept": kept_qd, "drift_total": total_qd}
+
+
 def integrity_section(conn):
     """
     Checagem de integridade da medição, ANTES de qualquer leitura de custo.
@@ -455,7 +527,7 @@ def integrity_section(conn):
         print("  RENT DE ATA")
         print(f"    medido  : {measured:,} lamports")
         if formula:
-            print(f"    formula : {formula:,} lamports  ((128+165) x 3480 x 2)")
+            print(f"    formula : {formula:,} lamports  ((128+165) x 2540 x 2)")
             if matches == 0:
                 print(f"    [!] DIVERGE em {abs(measured-formula):,} lamports "
                       f"({(measured/formula-1)*100:+.1f}%)")
@@ -480,7 +552,7 @@ def integrity_section(conn):
     groups = {}
     for size, sig1, sig2, h1, h2 in conn.execute(
         "SELECT position_size_usdc, leg1_route_sig, leg2_route_sig, leg1_hops, leg2_hops "
-        "FROM round_trip WHERE error IS NULL "
+        "FROM round_trip_cohort WHERE error IS NULL "
         "GROUP BY position_size_usdc ORDER BY position_size_usdc"
     ):
         groups.setdefault((sig1, sig2), []).append((size, h1, h2))
@@ -500,10 +572,83 @@ def integrity_section(conn):
             print(f"    {len(groups)} rotas distintas entre os tamanhos. Comparar perda")
             print("    entre grupos mistura taxa de venue com impacto de tamanho.")
 
+    # ── Item 3: proveniencia do cu_consumed ──
+    print()
+    print("  PROVENIENCIA DO cu_consumed")
+    print("  " + "-" * 68)
+    print("    Toda a tabela de break-even depende deste numero.")
+    sources = conn.execute(
+        "SELECT COALESCE(cu_consumed_source,'?'), COUNT(*), AVG(leg1_cu_consumed) "
+        "FROM round_trip_cohort WHERE error IS NULL GROUP BY cu_consumed_source"
+    ).fetchall()
+    cu_by_source = {}
+    if not sources:
+        print("    sem dados")
+    else:
+        tot = sum(n for _, n, _ in sources)
+        print()
+        print(f"    {'FONTE':>20} | {'AMOSTRAS':>9} | {'%':>6} | {'cu medio':>10}")
+        print("    " + "-" * 56)
+        for src, n, avg_cu in sources:
+            print(f"    {src:>20} | {n:>9} | {n/tot*100:>5.1f}% | "
+                  + (f"{avg_cu:>10.0f}" if avg_cu else f"{'—':>10}"))
+            cu_by_source[src] = {"samples": n, "avg_cu": avg_cu}
+        sim = cu_by_source.get("simulation", {}).get("avg_cu")
+        est = cu_by_source.get("jupiter_estimate", {}).get("avg_cu")
+        if sim and est:
+            div = abs(sim - est) / min(sim, est) * 100
+            print()
+            print(f"    simulacao {sim:.0f} vs estimativa Jupiter {est:.0f} "
+                  f"-> divergencia {div:.1f}%")
+            if div > 10:
+                print("    [!] As duas fontes discordam. O break-even muda conforme a fonte.")
+        elif est and not sim:
+            print()
+            print("    [!] NENHUMA amostra veio de simulateTransaction — tudo e")
+            print("        estimativa do Jupiter. O RPC publico recusa simulacao.")
+            print("        Use SOLANA_RPC_URL dedicado para medir cu de verdade.")
+
+    # ── Item 4: saturacao na coleta de priority fee ──
+    print()
+    print("  FORMA DA COLETA DE PRIORITY FEE (deteccao de cap)")
+    print("  " + "-" * 68)
+    shape = conn.execute(
+        "SELECT cu_price_samples, fee_distinct_values, fee_max_count, fee_top_values, "
+        "       cu_price_p90, cu_price_p99 FROM run "
+        "WHERE fee_top_values IS NOT NULL ORDER BY run_id DESC LIMIT 1"
+    ).fetchone()
+    if not shape:
+        print("    Sem dados de forma — amostra de versao anterior do script.")
+        print("    Percentil redondo (ex.: 1.500.000 exato) e suspeito de teto e nao")
+        print("    de observacao; a versao nova grava os valores de topo para checar.")
+    else:
+        n_s, distinct, max_count, top_json, p90, p99 = shape
+        print(f"    amostras {n_s} | valores distintos {distinct} | "
+              f"empates no maximo {max_count}")
+        try:
+            top = json.loads(top_json)
+            print()
+            print(f"    {'VALOR':>14} | {'OCORRENCIAS':>12}")
+            print("    " + "-" * 30)
+            for t in top:
+                print(f"    {t['value']:>14,} | {t['count']:>12}")
+        except (json.JSONDecodeError, TypeError, KeyError):
+            top = []
+        if n_s and max_count and max_count / n_s > 0.1:
+            print()
+            print(f"    [!] {max_count/n_s*100:.0f}% das amostras empatam no valor maximo.")
+            print("        Isso e assinatura de CAP ou saturacao, nao de distribuicao")
+            print("        empirica. Percentis altos ficam suspeitos.")
+        for label, v in [("p90", p90), ("p99", p99)]:
+            if v and v >= 100000 and v % 100000 == 0:
+                print()
+                print(f"    [!] {label} = {v:,.0f} e redondo demais para ser empirico.")
+                print("        Verifique se ha teto na coleta antes de usar no break-even.")
+
     # ── Teste 1 (SECUNDARIO): monotonicidade DENTRO da mesma rota ──
     rows = conn.execute(
         "SELECT position_size_usdc, AVG(swap_loss_pct), COUNT(*) "
-        "FROM round_trip WHERE error IS NULL AND swap_loss_pct IS NOT NULL "
+        "FROM round_trip_cohort WHERE error IS NULL AND swap_loss_pct IS NOT NULL "
         "GROUP BY position_size_usdc ORDER BY position_size_usdc"
     ).fetchall()
     loss_by_size = {r[0]: r[1] for r in rows}
@@ -557,23 +702,28 @@ def integrity_section(conn):
         print("    [OK] todos os tamanhos acima do piso.")
 
     # ── TESTE 0: contaminacao por gap entre pernas ──
-    gapstats = conn.execute(
-        "SELECT COUNT(*), SUM(COALESCE(leg_gap_contaminated,0)), AVG(leg_gap_ms), MAX(leg_gap_ms) "
-        "FROM round_trip WHERE error IS NULL AND leg_gap_ms IS NOT NULL"
-    ).fetchone()
+    # Contaminacao DERIVADA do proprio gap, nao do campo gravado pelo script:
+    # amostras de versoes anteriores nao tem esse campo e um COALESCE(...,0)
+    # as contava como limpas, produzindo contagem incoerente com a media.
+    gaps = [r[0] for r in conn.execute(
+        "SELECT leg_gap_ms FROM round_trip_cohort "
+        "WHERE error IS NULL AND leg_gap_ms IS NOT NULL ORDER BY leg_gap_ms"
+    )]
     print()
     print("  TESTE 0 — GAP ENTRE AS PERNAS DO ROUND TRIP")
     print("  " + "-" * 68)
-    if not gapstats or gapstats[0] == 0:
+    if not gaps:
         print("    sem dados de gap")
     else:
-        total, contaminated, avg_gap, max_gap = gapstats
-        contaminated = contaminated or 0
-        print(f"    gap medio {avg_gap:.0f}ms | maximo {max_gap:.0f}ms | "
-              f"limite {MAX_LEG_GAP_MS}ms")
+        total = len(gaps)
+        contaminated = sum(1 for g in gaps if g > MAX_LEG_GAP_MS)
+        avg_gap, max_gap = sum(gaps) / total, gaps[-1]
+        print(f"    n={total} | p50 {pct(gaps,0.5):.0f}ms | p90 {pct(gaps,0.9):.0f}ms | "
+              f"max {max_gap:.0f}ms | media {avg_gap:.0f}ms")
+        print(f"    limite {MAX_LEG_GAP_MS}ms -> {contaminated} acima ({contaminated/total*100:.0f}%)")
         if contaminated:
             verdicts["leg_gap"] = False
-            print(f"    [FALHOU] {contaminated}/{total} amostras com gap acima do limite.")
+            print(f"    [FALHOU] {contaminated}/{total} amostras acima do limite.")
             print("             A deriva de preco entre as pernas compete com o custo")
             print("             medido. Essas amostras medem oscilacao, nao custo.")
         else:
@@ -587,7 +737,7 @@ def integrity_section(conn):
     venues = conn.execute(
         "SELECT venue, COUNT(*), SUM(CASE WHEN fee_rate_bps > 0 THEN 1 ELSE 0 END), "
         "       AVG(CASE WHEN fee_rate_bps > 0 THEN fee_rate_bps END) "
-        "FROM route_hop GROUP BY venue ORDER BY COUNT(*) DESC"
+        "FROM route_hop_cohort GROUP BY venue ORDER BY COUNT(*) DESC"
     ).fetchall()
     declared = spread = 0
     venue_rows = []
@@ -624,7 +774,7 @@ def integrity_section(conn):
     cross = conn.execute(
         "SELECT position_size_usdc, AVG(swap_loss_pct), AVG(fee_routeplan_pct), "
         "       AVG(fee_discrepancy_usdc), AVG(leg_gap_ms), COUNT(*) "
-        "FROM round_trip WHERE error IS NULL AND fee_routeplan_pct > 0 "
+        "FROM round_trip_cohort WHERE error IS NULL AND fee_routeplan_pct > 0 "
         "GROUP BY position_size_usdc ORDER BY position_size_usdc"
     ).fetchall()
     if not cross:
@@ -663,7 +813,7 @@ def integrity_section(conn):
     drift_by_h = drift_stats(conn)
     rt_rows = conn.execute(
         "SELECT position_size_usdc, AVG(swap_loss_pct), AVG(leg_gap_ms), COUNT(*) "
-        "FROM round_trip WHERE error IS NULL AND swap_loss_pct IS NOT NULL "
+        "FROM round_trip_cohort WHERE error IS NULL AND swap_loss_pct IS NOT NULL "
         "AND leg_gap_ms IS NOT NULL GROUP BY position_size_usdc ORDER BY position_size_usdc"
     ).fetchall()
     if not drift_by_h or not rt_rows:
@@ -701,7 +851,7 @@ def integrity_section(conn):
     print("    herdada: 0,25% do Raydium nunca foi medido, foi assumido.")
     hops = conn.execute(
         "SELECT position_size_usdc, leg, hop_index, venue, AVG(fee_rate_bps), COUNT(*) "
-        "FROM route_hop WHERE fee_rate_bps IS NOT NULL "
+        "FROM route_hop_cohort WHERE fee_rate_bps IS NOT NULL "
         "GROUP BY position_size_usdc, leg, hop_index, venue "
         "ORDER BY position_size_usdc, leg, hop_index"
     ).fetchall()
@@ -776,7 +926,7 @@ def decomposition_section(conn, sol_price):
     rows = conn.execute(
         "SELECT position_size_usdc, AVG(net_lamports_median), AVG(net_lamports_p90), "
         "       AVG(fee_routeplan_pct), COUNT(*) "
-        "FROM round_trip WHERE error IS NULL AND net_lamports_median IS NOT NULL "
+        "FROM round_trip_cohort WHERE error IS NULL AND net_lamports_median IS NOT NULL "
         "GROUP BY position_size_usdc ORDER BY position_size_usdc"
     ).fetchall()
     print()
@@ -870,7 +1020,7 @@ def dispersion_section(conn, sol_price):
     ).fetchone()
     cu = conn.execute(
         "SELECT AVG(leg1_cu_consumed + leg2_cu_consumed), AVG(leg1_signatures + leg2_signatures) "
-        "FROM round_trip WHERE leg1_cu_consumed IS NOT NULL"
+        "FROM round_trip_cohort WHERE leg1_cu_consumed IS NOT NULL"
     ).fetchone()
     if not row or row[1] is None:
         print("  sem dados de priority fee filtrada")
@@ -929,7 +1079,7 @@ def drift_stats(conn, size=None):
     esse caso que define o break-even conservador.
     """
     q = (
-        "SELECT nominal_horizon_ms, drift_bps FROM quote_drift "
+        "SELECT nominal_horizon_ms, drift_bps FROM quote_drift_cohort "
         "WHERE drift_bps IS NOT NULL AND nominal_horizon_ms > 0"
     )
     params = []
@@ -969,7 +1119,7 @@ def effective_n(conn, horizon_ms):
     vals = [
         r[0]
         for r in conn.execute(
-            "SELECT drift_bps FROM quote_drift "
+            "SELECT drift_bps FROM quote_drift_cohort "
             "WHERE drift_bps IS NOT NULL AND nominal_horizon_ms = ? ORDER BY id",
             (horizon_ms,),
         )
@@ -1005,21 +1155,21 @@ def calibration_section(conn):
     A cauda de drift adverso vem de histórico, no Day 2–3.
     """
     paired = conn.execute(
-        "SELECT COUNT(*) FROM quote_drift "
+        "SELECT COUNT(*) FROM quote_drift_cohort "
         "WHERE drift_bps IS NOT NULL AND mid_drift_bps IS NOT NULL"
     ).fetchone()[0]
     mismatched = conn.execute(
-        "SELECT COUNT(*) FROM quote_drift "
+        "SELECT COUNT(*) FROM quote_drift_cohort "
         "WHERE drift_bps IS NOT NULL AND mid_drift_bps IS NOT NULL "
         "AND route_match = 0"
     ).fetchone()[0]
     unknown_route = conn.execute(
-        "SELECT COUNT(*) FROM quote_drift "
+        "SELECT COUNT(*) FROM quote_drift_cohort "
         "WHERE drift_bps IS NOT NULL AND mid_drift_bps IS NOT NULL "
         "AND route_match IS NULL"
     ).fetchone()[0]
     route_changed = conn.execute(
-        "SELECT COUNT(*) FROM quote_drift WHERE size_route_changed = 1"
+        "SELECT COUNT(*) FROM quote_drift_cohort WHERE size_route_changed = 1"
     ).fetchone()[0]
 
     # Jupiter roteia por tamanho: sonda pode sair single-hop e a real abrir
@@ -1029,7 +1179,7 @@ def calibration_section(conn):
         conn.execute(
             """SELECT nominal_horizon_ms, position_size_usdc,
                       drift_bps, mid_drift_bps, size_component_bps
-               FROM quote_drift
+               FROM quote_drift_cohort
                WHERE drift_bps IS NOT NULL AND mid_drift_bps IS NOT NULL
                  AND route_match = 1
                ORDER BY nominal_horizon_ms, position_size_usdc"""
@@ -1109,7 +1259,7 @@ def signed_percentiles(conn):
     """
     by_h = {}
     for h, d in conn.execute(
-        "SELECT nominal_horizon_ms, drift_bps FROM quote_drift "
+        "SELECT nominal_horizon_ms, drift_bps FROM quote_drift_cohort "
         "WHERE drift_bps IS NOT NULL AND nominal_horizon_ms > 0"
     ):
         by_h.setdefault(h, []).append(d)
@@ -1144,7 +1294,7 @@ def revert_floor(conn, horizon_ms, tolerances_bps=SLIPPAGE_GRID_BPS, n_eff=None)
     vals = [
         r[0]
         for r in conn.execute(
-            "SELECT drift_bps FROM quote_drift "
+            "SELECT drift_bps FROM quote_drift_cohort "
             "WHERE drift_bps IS NOT NULL AND nominal_horizon_ms = ?",
             (horizon_ms,),
         )
@@ -1410,13 +1560,16 @@ def coverage(conn):
 
 def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
            out_dir: Path = ROOT / "measurements") -> None:
+    # Primeiro de tudo: as views de coorte, que todas as queries abaixo usam.
+    cohort = build_cohort(conn)
+
     runs = conn.execute(
         "SELECT COUNT(*), MIN(timestamp_utc), MAX(timestamp_utc) FROM run"
     ).fetchone()
     n_runs, first, last = runs
 
-    ok = conn.execute("SELECT COUNT(*) FROM round_trip WHERE error IS NULL").fetchone()[0]
-    failed = conn.execute("SELECT COUNT(*) FROM round_trip WHERE error IS NOT NULL").fetchone()[0]
+    ok = conn.execute("SELECT COUNT(*) FROM round_trip_cohort WHERE error IS NULL").fetchone()[0]
+    failed = conn.execute("SELECT COUNT(*) FROM round_trip_cohort WHERE error IS NOT NULL").fetchone()[0]
 
     print()
     print("=" * 78)
@@ -1429,7 +1582,7 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
         print()
         print("  NENHUMA AMOSTRA VÁLIDA. Erros registrados:")
         for (err,) in conn.execute(
-            "SELECT DISTINCT error FROM round_trip WHERE error IS NOT NULL LIMIT 10"
+            "SELECT DISTINCT error FROM round_trip_cohort WHERE error IS NOT NULL LIMIT 10"
         ):
             print(f"    - {err}")
         print()
@@ -1510,7 +1663,7 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
     sizes = [
         r[0]
         for r in conn.execute(
-            "SELECT DISTINCT position_size_usdc FROM round_trip "
+            "SELECT DISTINCT position_size_usdc FROM round_trip_cohort "
             "WHERE error IS NULL ORDER BY position_size_usdc"
         )
     ]
@@ -1518,7 +1671,7 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
     for size in sizes:
         rows = conn.execute(
             """SELECT swap_loss_usdc, swap_loss_pct, net_lamports_median, net_lamports_p90
-               FROM round_trip WHERE position_size_usdc = ? AND error IS NULL""",
+               FROM round_trip_cohort WHERE position_size_usdc = ? AND error IS NULL""",
             (size,),
         ).fetchall()
 
@@ -1666,7 +1819,7 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
     print("  " + "-" * 74)
     for size, v1, v2, h1, h2, n in conn.execute(
         """SELECT position_size_usdc, leg1_venues, leg2_venues, leg1_hops, leg2_hops, COUNT(*)
-           FROM round_trip WHERE error IS NULL
+           FROM round_trip_cohort WHERE error IS NULL
            GROUP BY position_size_usdc, leg1_venues, leg2_venues
            ORDER BY position_size_usdc"""
     ):
@@ -1674,7 +1827,7 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
 
     # ── Garantia da emenda 3 ──
     leaked = conn.execute(
-        "SELECT COUNT(*) FROM round_trip "
+        "SELECT COUNT(*) FROM round_trip_cohort "
         "WHERE leg1_realized_slip_pct IS NOT NULL OR leg2_realized_slip_pct IS NOT NULL"
     ).fetchone()[0]
     print()
@@ -1687,7 +1840,7 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
         print("           Isso não deveria acontecer fora da execução real.")
 
     fail_leaked = conn.execute(
-        "SELECT COUNT(*) FROM round_trip WHERE tx_failure_rate IS NOT NULL"
+        "SELECT COUNT(*) FROM round_trip_cohort WHERE tx_failure_rate IS NOT NULL"
     ).fetchone()[0]
     if fail_leaked == 0:
         print("  [OK] tx_failure_rate vazio em todas as amostras — correto na Fase 1.")
@@ -1703,6 +1856,7 @@ def report(conn: sqlite3.Connection, core_mints: int = DEFAULT_CORE_MINTS,
             {
                 "summary": summary,
                 "sol_usdc_price_measured": sol_price,
+                "cohort": cohort,
                 "integrity": integrity,
                 "decomposition": decomp,
                 "priority_fee_dispersion": dispersion,
