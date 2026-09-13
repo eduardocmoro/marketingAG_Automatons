@@ -1504,11 +1504,21 @@ def coverage(conn):
     Uma hora corrida de amostras é UM regime de congestionamento, não uma
     distribuição. Sem janelas espalhadas, mediana e p90 descrevem aquela hora
     e nada além dela.
+
+    Conta apenas a coorte da versão mais recente: mudar o método de medição
+    da fee invalida a comparação entre janelas.
     """
+    # SO a coorte atual. Blocos antigos mediam a priority fee com filtro de
+    # MINTS, que nao filtrava nada — misturar aqui faria o "spread de
+    # congestionamento" refletir a mudanca de metodologia em vez de
+    # congestionamento real, e passar o gate por motivo errado.
     rows = [
         (parse_ts(r[0]), r[1])
         for r in conn.execute(
-            "SELECT timestamp_utc, cu_price_median FROM run ORDER BY timestamp_utc"
+            "SELECT timestamp_utc, cu_price_median FROM run "
+            "WHERE COALESCE(schema_version,0) = "
+            "      (SELECT MAX(COALESCE(schema_version,0)) FROM run) "
+            "ORDER BY timestamp_utc"
         )
     ]
     rows = [(t, c) for t, c in rows if t is not None]
