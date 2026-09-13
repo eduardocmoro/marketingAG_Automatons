@@ -55,6 +55,10 @@ const MID_PROBE_USDC = 0.1;
 // calibracao de qualquer forma. Corta 4 tamanhos x 12 chamadas por execucao.
 const DRIFT_SIZES_USDC = [0.5, 1, 2, 5];
 
+// Intervalo maximo aceitavel entre as duas quotes do round trip. Acima
+// disto a deriva de preco compete com o custo medido e a amostra nao serve.
+const MAX_LEG_GAP_MS = 300;
+
 const RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 
 /**
@@ -453,10 +457,16 @@ function networkFeeLamports(signatures, cuPriceMicroLamports, cuConsumed) {
 async function measureAtaRent() {
   // Fórmula de rent da Solana:
   //   (ACCOUNT_STORAGE_OVERHEAD + bytes) x LAMPORTS_PER_BYTE_YEAR x THRESHOLD
-  //   = (128 + bytes) x 3480 x 2
-  // Sonda vários tamanhos para diagnosticar divergência entre medido e
-  // fórmula em vez de assumir a constante.
-  const predict = (bytes) => (128 + bytes) * 3480 * 2;
+  //   = (128 + bytes) x 2540 x 2
+  //
+  // LAMPORTS_PER_BYTE_YEAR = 2540, NAO 3480. Derivado de tres sondas
+  // independentes medidas na mainnet, com erro zero em todas:
+  //     0 bytes : 128 x 2540 x 2 =   650.240  (medido   650.240)
+  //    82 bytes : 210 x 2540 x 2 = 1.066.800  (medido 1.066.800)
+  //   165 bytes : 293 x 2540 x 2 = 1.488.440  (medido 1.488.440)
+  // O valor MEDIDO segue sendo a fonte de verdade; a formula so existe
+  // para o relatorio flagrar divergencia se a rede mudar o parametro.
+  const predict = (bytes) => (128 + bytes) * 2540 * 2;
   const probes = [];
   for (const bytes of [0, 82, SPL_TOKEN_ACCOUNT_BYTES]) {
     try {
@@ -667,10 +677,18 @@ async function measureRoundTrip(sizeUsdc, priorityFee) {
     const t1 = Date.now();
     const q1 = await jupQuote(USDC_MINT, SOL_MINT, inRaw);
     const t1done = Date.now();
-    const q2 = await jupQuote(SOL_MINT, USDC_MINT, q1.outAmount);
+    // minGap 0 DE PROPOSITO: o throttle global caindo aqui separava as
+    // pernas por JUP_MIN_GAP_MS e a "perda" medida virava oscilacao de
+    // preco. A folga de rate limit e recuperada ENTRE TAMANHOS, nunca
+    // entre as pernas. Se o limite apertar, corte tamanhos — nunca separe
+    // leg1 de leg2.
+    const q2 = await jupQuote(SOL_MINT, USDC_MINT, q1.outAmount, 50, 0);
     const t2done = Date.now();
     sample.legGapMs = t2done - t1done;
     sample.leg1QuoteMs = t1done - t1;
+    // Acima disto a deriva de preco entre as pernas compete com o custo
+    // que se quer medir. A amostra se declara contaminada.
+    sample.legGapContaminated = sample.legGapMs > MAX_LEG_GAP_MS;
 
     // CU medido depois: o timing dele não afeta mais o encadeamento.
     let swap1 = null;
@@ -836,6 +854,8 @@ async function main() {
     process.stdout.write(`      $${size} ... `);
     const rt = await measureRoundTrip(size, priorityFee);
     roundTrips.push(rt);
+    // Compensa aqui as chamadas que sairam sem throttle dentro do round trip.
+    await sleep(JUP_MIN_GAP_MS);
     if (rt.error) {
       console.log(`ERRO: ${rt.error}`);
     } else {
@@ -843,7 +863,7 @@ async function main() {
       console.log(
         `retorno ${rt.roundTripReturnPct >= 0 ? "+" : ""}${rt.roundTripReturnPct.toFixed(4)}%` +
           ` | taxa routePlan ${cc ? cc.totalFeePctOfPosition.toFixed(4) + "%" : "n/d"}` +
-          ` | gap ${rt.legGapMs}ms`
+          ` | gap ${rt.legGapMs}ms${rt.legGapContaminated ? " CONTAMINADO" : ""}`
       );
     }
   }

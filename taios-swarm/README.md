@@ -90,7 +90,7 @@ Zero código de estratégia. O que é medido:
 | Componente | Como |
 |---|---|
 | Fee de rede | `(base_fee × signatures) + (cu_price × cu_consumed)`; `cu_consumed` via `simulateTransaction` na tx real do Jupiter |
-| Priority fee | `getRecentPrioritizationFees`, distribuição (mediana e p90), não ponto único |
+| Priority fee | `getRecentPrioritizationFees` **filtrado pelos `ammKey` da rota**, em p25/p50/p75/p90/p99 |
 | Fee de pool | `routePlan` real da quote — venue, `feeAmount`, `feeMint`, nº de hops por salto. Nada fixado em 0,25% |
 | Price impact cotado | `priceImpactPct` da quote, **nas duas direções** (assimétrico em CLMM) |
 | Drift por latência | mesma quote recotada após 250ms / 500ms / 1s / 2s / 5s |
@@ -105,9 +105,24 @@ seguintes, de todos os agentes. Sob [ADR-001](docs/ADR-001-carteira-unica.md) o
 enxame inteiro usa uma carteira só, então são **N ATAs no total, para sempre** —
 uma por mint negociado, não uma por posição nem uma por agente.
 
-- rent por ATA: 0,00204 SOL, **recuperável** (volta integralmente no close)
-- 5 mints do núcleo: ~0,0102 SOL travados, **uma vez**
+- rent por ATA: **0,00148844 SOL**, **recuperável** (volta integralmente no close)
+- 5 mints do núcleo: ~0,00744 SOL travados, **uma vez** (~US$0,77 a SOL US$103)
 - custo por trade: **zero** — não escala com o número de trades
+
+#### `LAMPORTS_PER_BYTE_YEAR` é 2540, não 3480
+
+A constante que eu usava estava errada. Três sondas independentes na mainnet
+batem com **2540**, erro zero em todas:
+
+```
+  0 bytes : 128 × 2540 × 2 =   650.240   (medido   650.240)
+ 82 bytes : 210 × 2540 × 2 = 1.066.800   (medido 1.066.800)
+165 bytes : 293 × 2540 × 2 = 1.488.440   (medido 1.488.440)
+```
+
+O script sonda os três tamanhos a cada execução e o **valor medido é a fonte de
+verdade**; a fórmula só existe para o relatório flagrar se a rede mudar o
+parâmetro.
 
 Por isso o rent ficou fora de `RoundTripCost` e do cálculo de break-even. O
 relatório converte pelo preço de SOL **medido na amostra**, nunca por constante.
@@ -290,6 +305,39 @@ feeMint == outputMint →  tier = feeAmount / outAmount
 
 O relatório imprime o tier por (tamanho, perna, salto, venue).
 
+#### Resultado medido: o custo em SOL/USDC não é AMM de taxa fixa
+
+Em ~60 rotas observadas, **Raydium CLMM apareceu 2 vezes**. A Jupiter
+praticamente não roteia SOL/USDC por AMM de 25 bps. A esmagadora maioria vai por
+**venues de spread** — market makers e cotação privada (Byreal, Quantum,
+HumidiFi, ZeroFi, SolFi, AlphaQ, GoonFi, Manifest, TesseraV, Kipseli, BisonFi,
+Deriverse, Flux) — que **não declaram `feeAmount`**: o custo está embutido no
+preço cotado como spread.
+
+> **A premissa herdada de 0,25% não se aplica a este par.** O custo de pool em
+> SOL/USDC via Jupiter é dominado por venues de spread, não por AMM de taxa fixa.
+
+Isso **reforça a decomposição**: em US$1 a taxa de rede domina por margem ainda
+maior que a calculada com 25 bps.
+
+O relatório classifica cada venue (AMM com fee declarada vs spread) e reporta a
+fração de saltos com `feeAmount > 0`.
+
+#### Validador para venue de spread
+
+`feeAmount = 0` não significa custo zero — significa que **não há taxa declarada
+para validar contra**. O TESTE 3 fica **NÃO APLICÁVEL** nesse caso, suspenso, nem
+aprovado nem reprovado.
+
+O validador que falta: comparar `outAmount` contra preço de referência
+**independente da Jupiter** — oracle on-chain (Pyth). Comparar quote contra quote
+da mesma fonte é circular. **Ainda não implementado**; exige decidir conta de
+preço, tratamento de staleness e intervalo de confiança do oracle.
+
+Enquanto isso, o **TESTE 4** valida pelo outro lado e funciona em venue de
+spread: a perda só é custo se for grande perto da **deriva de preço no mesmo
+intervalo** entre as pernas. Razão < 3x é indistinguível de ruído.
+
 **Mas tier baixo não salva o desenho de US$1.** Taxa de pool é percentual;
 custo de rede é **fixo em dólar**. Em posição pequena o fixo domina:
 
@@ -316,6 +364,16 @@ priority fee. A coluna p90 é a que descreve o pior caso operacional, e é ela q
 decide o desenho — deixar só a mediana visível subestima o custo por ~8x. O
 cruzamento também sai nas duas: com tier de 0,02%, ~US$5 na mediana e ~US$42 no
 p90. **Um desenho que só fecha na coluna mediana não fecha em congestionamento.**
+
+#### Priority fee: usar sempre a filtrada por pool
+
+Medido: **global mediana 0 / p90 0**, mas **filtrada por pool mediana 0 / p90
+128.050**. Os pools estão disputados mesmo com a rede calma — passar os mints não
+filtrava nada e o p90 global de 170.893 da primeira rodada era **ruído de outras
+contas**.
+
+O break-even usa **sempre a filtrada**. A global fica no relatório só como
+referência de contraste.
 
 ### Decisão de desenho: abstenção por priority fee
 

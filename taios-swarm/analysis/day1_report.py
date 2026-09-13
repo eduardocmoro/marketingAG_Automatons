@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS round_trip (
     leg2_cu_consumed        INTEGER,
     leg1_signatures         INTEGER,
     leg2_signatures         INTEGER,
+    leg_gap_contaminated    INTEGER,-- gap entre pernas alto demais
     leg1_route_sig          TEXT,   -- pools+split concretos da perna 1
     leg2_route_sig          TEXT,
     error                   TEXT
@@ -157,6 +158,10 @@ THESIS_POSITION_USDC = 1.0
 # que a taxa de pool NAO entrou na conta.
 CHEAPEST_POOL_ROUND_TRIP_PCT = 0.02
 
+# Gap maximo entre as duas quotes do round trip. Acima disto a deriva de
+# preco compete com o custo medido e a amostra nao serve.
+MAX_LEG_GAP_MS = 300
+
 
 def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -186,6 +191,7 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
         ("round_trip", "leg2_cu_consumed", "INTEGER"),
         ("round_trip", "leg1_signatures", "INTEGER"),
         ("round_trip", "leg2_signatures", "INTEGER"),
+        ("round_trip", "leg_gap_contaminated", "INTEGER"),
         ("quote_drift", "route_match", "INTEGER"),
         ("quote_drift", "size_route", "TEXT"),
         ("quote_drift", "probe_route", "TEXT"),
@@ -281,8 +287,9 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                         fee_routeplan_usdc, fee_routeplan_pct,
                         fee_discrepancy_usdc, leg1_route_sig, leg2_route_sig,
                         leg1_cu_consumed, leg2_cu_consumed,
-                        leg1_signatures, leg2_signatures, error)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        leg1_signatures, leg2_signatures,
+                        leg_gap_contaminated, error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         run_id,
                         rt.get("positionSizeUsdc"),
@@ -313,6 +320,8 @@ def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
                         (leg2.get("compute") or {}).get("cuConsumed"),
                         (leg1.get("compute") or {}).get("signatures"),
                         (leg2.get("compute") or {}).get("signatures"),
+                        None if rt.get("legGapContaminated") is None
+                        else int(rt["legGapContaminated"]),
                         rt.get("error"),
                     ),
                 )
@@ -420,7 +429,8 @@ def integrity_section(conn):
     print("  INTEGRIDADE DA MEDICAO")
     print("=" * 78)
 
-    verdicts = {"monotonic": None, "above_floor": None, "fee_crosscheck": None}
+    verdicts = {"leg_gap": None, "monotonic": None, "above_floor": None,
+                "fee_crosscheck": None, "signal_vs_drift": None}
 
     # ── Completude e rate limit ──
     incomplete = conn.execute(
@@ -546,25 +556,91 @@ def integrity_section(conn):
         verdicts["above_floor"] = True
         print("    [OK] todos os tamanhos acima do piso.")
 
-    # ── Teste 3 (PRIMARIO): validacao cruzada, independente de rota ──
+    # ── TESTE 0: contaminacao por gap entre pernas ──
+    gapstats = conn.execute(
+        "SELECT COUNT(*), SUM(COALESCE(leg_gap_contaminated,0)), AVG(leg_gap_ms), MAX(leg_gap_ms) "
+        "FROM round_trip WHERE error IS NULL AND leg_gap_ms IS NOT NULL"
+    ).fetchone()
     print()
-    print("  TESTE 3 (PRIMARIO) — PERDA OBSERVADA vs feeAmount DAQUELA ROTA")
+    print("  TESTE 0 — GAP ENTRE AS PERNAS DO ROUND TRIP")
     print("  " + "-" * 68)
-    print("    Unico teste independente de rota: compara contra a taxa que o")
-    print("    roteador cobrou NAQUELE caminho especifico.")
+    if not gapstats or gapstats[0] == 0:
+        print("    sem dados de gap")
+    else:
+        total, contaminated, avg_gap, max_gap = gapstats
+        contaminated = contaminated or 0
+        print(f"    gap medio {avg_gap:.0f}ms | maximo {max_gap:.0f}ms | "
+              f"limite {MAX_LEG_GAP_MS}ms")
+        if contaminated:
+            verdicts["leg_gap"] = False
+            print(f"    [FALHOU] {contaminated}/{total} amostras com gap acima do limite.")
+            print("             A deriva de preco entre as pernas compete com o custo")
+            print("             medido. Essas amostras medem oscilacao, nao custo.")
+        else:
+            verdicts["leg_gap"] = True
+            print(f"    [OK] {total} amostras dentro do limite.")
+
+    # ── Classificacao de venue: AMM com fee declarada vs venue de spread ──
+    print()
+    print("  CLASSIFICACAO DE VENUE")
+    print("  " + "-" * 68)
+    venues = conn.execute(
+        "SELECT venue, COUNT(*), SUM(CASE WHEN fee_rate_bps > 0 THEN 1 ELSE 0 END), "
+        "       AVG(CASE WHEN fee_rate_bps > 0 THEN fee_rate_bps END) "
+        "FROM route_hop GROUP BY venue ORDER BY COUNT(*) DESC"
+    ).fetchall()
+    declared = spread = 0
+    venue_rows = []
+    if not venues:
+        print("    sem dados de rota")
+    else:
+        print(f"    {'VENUE':>16} | {'ROTAS':>6} | {'COM FEE':>8} | {'TIER bps':>9} | TIPO")
+        print("    " + "-" * 62)
+        for venue, n, with_fee, avg_tier in venues:
+            with_fee = with_fee or 0
+            kind = "AMM (fee declarada)" if with_fee > 0 else "spread (fee embutida)"
+            declared += with_fee
+            spread += n - with_fee
+            tier = f"{avg_tier:.2f}" if avg_tier else "—"
+            print(f"    {(venue or '?')[:16]:>16} | {n:>6} | {with_fee:>8} | {tier:>9} | {kind}")
+            venue_rows.append({"venue": venue, "routes": n, "with_fee": with_fee,
+                               "avg_tier_bps": avg_tier})
+        total_hops = declared + spread
+        pct_declared = declared / total_hops * 100 if total_hops else 0
+        print()
+        print(f"    saltos com feeAmount declarada: {declared}/{total_hops} "
+              f"({pct_declared:.1f}%)")
+        if pct_declared < 50:
+            print()
+            print("    A maioria das rotas passa por VENUE DE SPREAD (market maker /")
+            print("    cotacao privada), que nao declara feeAmount — o custo esta")
+            print("    embutido no preco cotado. Para esses, a perda do round trip E a")
+            print("    medicao; nao existe fee para validar contra.")
+
+    # ── Teste 3: validacao cruzada, SO onde ha fee declarada ──
+    print()
+    print("  TESTE 3 — PERDA OBSERVADA vs feeAmount DECLARADA")
+    print("  " + "-" * 68)
     cross = conn.execute(
         "SELECT position_size_usdc, AVG(swap_loss_pct), AVG(fee_routeplan_pct), "
         "       AVG(fee_discrepancy_usdc), AVG(leg_gap_ms), COUNT(*) "
-        "FROM round_trip WHERE error IS NULL AND fee_routeplan_pct IS NOT NULL "
+        "FROM round_trip WHERE error IS NULL AND fee_routeplan_pct > 0 "
         "GROUP BY position_size_usdc ORDER BY position_size_usdc"
     ).fetchall()
     if not cross:
+        verdicts["fee_crosscheck"] = None
+        print("    NAO APLICAVEL: nenhuma rota declarou feeAmount > 0.")
+        print("    Venue de spread embute o custo no preco e nao expoe taxa.")
+        print("    Comparar contra zero nao valida nada — o teste fica suspenso,")
+        print("    nao aprovado nem reprovado.")
         print()
-        print("    Sem dados de routePlan fee — amostra de versao anterior.")
-        print("    Rode a medicao atualizada.")
+        print("    VALIDADOR NECESSARIO (nao implementado): comparar outAmount")
+        print("    contra preco de referencia INDEPENDENTE da Jupiter — oracle")
+        print("    on-chain (Pyth). Comparar quote contra quote da mesma fonte e")
+        print("    circular. Ver README, secao 'Validador para venue de spread'.")
     else:
         print()
-        print(f"    {'TAM':>7} | {'OBSERVADO %':>12} | {'routePlan %':>12} | "
+        print(f"    {'TAM':>7} | {'OBSERVADO %':>12} | {'FEE DECL. %':>12} | "
               f"{'DIFF US$':>11} | {'gap ms':>7}")
         bad = 0
         for size, obs, fee, disc, gap, n in cross:
@@ -575,13 +651,47 @@ def integrity_section(conn):
                   f"{disc:>11.6f} | {gap or 0:>7.0f}" + ("  <-- ABAIXO da taxa" if suspect else ""))
         verdicts["fee_crosscheck"] = bad == 0
         print()
-        if bad:
-            print(f"    [FALHOU] {bad} tamanho(s) com perda observada MENOR que a taxa")
-            print("             que o roteador diz ter cobrado naquela mesma rota.")
-            print("             Fisicamente impossivel — bug no encadeamento.")
+        print(f"    [FALHOU] {bad} tamanho(s) com perda menor que a fee declarada."
+              if bad else "    [OK] perda cobre a fee declarada onde ela existe.")
+
+    # ── TESTE 4: sinal vs ruido de deriva ──
+    print()
+    print("  TESTE 4 — PERDA MEDIDA vs DERIVA NO MESMO INTERVALO")
+    print("  " + "-" * 68)
+    print("    Validador que funciona tambem em venue de spread: a perda so e")
+    print("    custo se for grande perto da oscilacao de preco no mesmo gap.")
+    drift_by_h = drift_stats(conn)
+    rt_rows = conn.execute(
+        "SELECT position_size_usdc, AVG(swap_loss_pct), AVG(leg_gap_ms), COUNT(*) "
+        "FROM round_trip WHERE error IS NULL AND swap_loss_pct IS NOT NULL "
+        "AND leg_gap_ms IS NOT NULL GROUP BY position_size_usdc ORDER BY position_size_usdc"
+    ).fetchall()
+    if not drift_by_h or not rt_rows:
+        verdicts["signal_vs_drift"] = None
+        print("    sem dados de drift ou de gap — teste nao aplicavel.")
+    else:
+        print()
+        print(f"    {'TAM':>7} | {'PERDA bps':>10} | {'gap ms':>7} | "
+              f"{'|DRIFT| bps':>12} | {'RAZAO':>7}")
+        weak = 0
+        for size, loss_pct, gap, n in rt_rows:
+            horizon = min(drift_by_h, key=lambda h: abs(h - (gap or 0)))
+            d = drift_by_h[horizon]["median_abs"]
+            loss_bps = loss_pct * 100
+            ratio = (loss_bps / d) if d and d > 0 else None
+            if ratio is not None and ratio < 3:
+                weak += 1
+            print(f"    {'$' + format(size, 'g'):>7} | {loss_bps:>10.3f} | {gap or 0:>7.0f} | "
+                  f"{d:>12.3f} | " + (f"{ratio:>6.1f}x" if ratio else f"{'—':>7}")
+                  + ("  <-- indistinguivel de ruido" if ratio and ratio < 3 else ""))
+        verdicts["signal_vs_drift"] = weak == 0
+        print()
+        if weak:
+            print(f"    [FALHOU] {weak} tamanho(s) com perda da mesma ordem da deriva.")
+            print("             Nao da para separar custo de oscilacao de preco.")
+            print("             Reduza o gap entre as pernas antes de ler custo.")
         else:
-            print("    [OK] perda observada cobre a taxa do routePlan em todos os tamanhos.")
-            print("         A sobra e price impact mais deriva entre pernas (gap ms).")
+            print("    [OK] perda pelo menos 3x a deriva do mesmo intervalo.")
 
     # ── Taxa efetiva de pool por tamanho: RESULTADO, nao premissa ──
     print()
@@ -620,18 +730,29 @@ def integrity_section(conn):
     # ── Veredito ──
     print()
     print("  " + "=" * 68)
-    if verdicts["fee_crosscheck"] is False:
-        print("  VEREDITO: MEDICAO INVALIDA — falhou no teste primario (cruzado).")
-        print("  Nao use os numeros de custo abaixo.")
-    elif verdicts["fee_crosscheck"] is True:
-        print("  VEREDITO: teste primario PASSOU. A perda observada e coerente com")
-        print("  a taxa da rota efetivamente usada.")
+    if verdicts["leg_gap"] is False:
+        print("  VEREDITO: MEDICAO INVALIDA — as pernas do round trip sairam")
+        print("  separadas demais. O que foi medido e deriva de preco, nao custo.")
+        print("  Corrija o gap e remeça antes de ler qualquer numero.")
+    elif verdicts["fee_crosscheck"] is False:
+        print("  VEREDITO: MEDICAO INVALIDA — perda menor que a fee declarada.")
+    elif verdicts["signal_vs_drift"] is False:
+        print("  VEREDITO: MEDICAO INCONCLUSIVA — a perda tem a mesma ordem de")
+        print("  grandeza da deriva no mesmo intervalo. Nao da para separar custo")
+        print("  de oscilacao. Nao use os numeros abaixo.")
+    elif verdicts["fee_crosscheck"] is True or verdicts["signal_vs_drift"] is True:
+        if verdicts["fee_crosscheck"] is True:
+            print("  VEREDITO: validado contra fee declarada e contra deriva.")
+        else:
+            print("  VEREDITO: validado contra DERIVA apenas.")
+            print("  A rota passa por venue de spread, que nao declara fee — falta o")
+            print("  validador independente (oracle Pyth). Tratar como PARCIAL.")
         if verdicts["monotonic"] is False:
-            print("  Ressalva: monotonicidade violada dentro de uma mesma rota — investigar.")
+            print("  Ressalva: monotonicidade violada dentro de uma mesma rota.")
         if verdicts["above_floor"] is False:
-            print("  Perda abaixo de 0,02% e explicada por venue de tier baixo, nao por bug.")
+            print("  Perda abaixo de 0,02% e esperada em venue de spread barato.")
     else:
-        print("  VEREDITO: teste primario sem dados. Rode a medicao atualizada.")
+        print("  VEREDITO: sem dados suficientes para validar.")
     print("  " + "=" * 68)
     return {**verdicts, "route_groups": len(groups), "pool_fee_by_size": fee_table}
 
