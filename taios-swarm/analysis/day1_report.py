@@ -42,6 +42,11 @@ WINDOW_GAP_HOURS = 1  # intervalo que separa duas janelas distintas
 # seja ao menos este múltiplo da mais calma.
 MIN_CONGESTION_SPREAD = 2.0
 
+# Condicao de coorte para queries sobre a tabela `run`. As views *_cohort
+# cobrem round_trip/quote_drift/route_hop; a propria `run` precisa disto.
+RUN_IN_COHORT = ("COALESCE(schema_version,0) = "
+                 "(SELECT MAX(COALESCE(schema_version,0)) FROM run)")
+
 
 # ── Ingestão: JSONL -> SQLite ────────────────────────────────────────
 
@@ -506,12 +511,14 @@ def integrity_section(conn):
 
     # ── Completude e rate limit ──
     incomplete = conn.execute(
-        "SELECT COUNT(*) FROM run WHERE complete = 0"
+        f"SELECT COUNT(*) FROM run WHERE complete = 0 AND {RUN_IN_COHORT}"
     ).fetchone()[0]
     hits = conn.execute(
-        "SELECT COALESCE(SUM(rate_limit_hits),0) FROM run"
+        f"SELECT COALESCE(SUM(rate_limit_hits),0) FROM run WHERE {RUN_IN_COHORT}"
     ).fetchone()[0]
-    total_runs = conn.execute("SELECT COUNT(*) FROM run").fetchone()[0]
+    total_runs = conn.execute(
+        f"SELECT COUNT(*) FROM run WHERE {RUN_IN_COHORT}"
+    ).fetchone()[0]
     if incomplete or hits:
         print()
         print(f"  [!] {incomplete}/{total_runs} execucao(oes) incompleta(s), "
@@ -520,8 +527,9 @@ def integrity_section(conn):
 
     # ── Rent: medido vs formula ──
     for measured, formula, matches in conn.execute(
-        "SELECT ata_rent_lamports, rent_formula_lamports, rent_matches_formula "
-        "FROM run WHERE ata_rent_lamports IS NOT NULL LIMIT 1"
+        f"SELECT ata_rent_lamports, rent_formula_lamports, rent_matches_formula "
+        f"FROM run WHERE ata_rent_lamports IS NOT NULL AND {RUN_IN_COHORT} "
+        f"ORDER BY run_id DESC LIMIT 1"
     ):
         print()
         print("  RENT DE ATA")
@@ -535,15 +543,23 @@ def integrity_section(conn):
                 print("        jsonl para diagnosticar o schedule de rent do RPC.")
 
     # ── Priority fee: global vs filtrado por pool ──
-    for gm, gp, fm, fp in conn.execute(
-        "SELECT cu_price_global_median, cu_price_global_p90, "
-        "cu_price_median, cu_price_p90 FROM run "
-        "WHERE cu_price_median IS NOT NULL LIMIT 1"
-    ):
+    # Agrega a COORTE inteira. Antes um LIMIT 1 sem ORDER BY nem filtro pegava
+    # a execucao mais antiga e imprimia valores do filtro de MINTS rotulados
+    # como "filtrado por pool".
+    pf_rows = conn.execute(
+        f"SELECT cu_price_global_median, cu_price_global_p90, "
+        f"cu_price_median, cu_price_p90 FROM run "
+        f"WHERE cu_price_median IS NOT NULL AND {RUN_IN_COHORT}"
+    ).fetchall()
+    if pf_rows:
+        def _med(i):
+            vals = [r[i] for r in pf_rows if r[i] is not None]
+            return statistics.median(vals) if vals else None
+        gm, gp, fm, fp = _med(0), _med(1), _med(2), _med(3)
         print()
-        print("  PRIORITY FEE (micro-lamports/CU)")
-        print(f"    global (rede inteira) : mediana {gm} | p90 {gp}")
-        print(f"    filtrado por pool     : mediana {fm} | p90 {fp}")
+        print(f"  PRIORITY FEE (micro-lamports/CU) — mediana de {len(pf_rows)} execucoes da coorte")
+        print(f"    global (rede inteira) : mediana {fmt(gm,0)} | p90 {fmt(gp,0)}")
+        print(f"    filtrado por pool     : mediana {fmt(fm,0)} | p90 {fmt(fp,0)}")
         if gm and gp and gm > 0 and gp / gm > 50:
             print(f"    [!] spread global de {gp/gm:.0f}x — o global e ruido da rede,")
             print("        nao a taxa relevante. Use a linha filtrada por pool.")
@@ -614,8 +630,9 @@ def integrity_section(conn):
     print("  " + "-" * 68)
     shape = conn.execute(
         "SELECT cu_price_samples, fee_distinct_values, fee_max_count, fee_top_values, "
-        "       cu_price_p90, cu_price_p99 FROM run "
-        "WHERE fee_top_values IS NOT NULL ORDER BY run_id DESC LIMIT 1"
+        f"       cu_price_p90, cu_price_p99 FROM run "
+        f"WHERE fee_top_values IS NOT NULL AND {RUN_IN_COHORT} "
+        f"ORDER BY run_id DESC LIMIT 1"
     ).fetchone()
     if not shape:
         print("    Sem dados de forma — amostra de versao anterior do script.")
