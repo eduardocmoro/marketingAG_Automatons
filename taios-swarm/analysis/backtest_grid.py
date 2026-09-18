@@ -228,12 +228,18 @@ def summarize(trades: list) -> dict:
     total = sum(trades)
     wins = sum(1 for t in trades if t > 0) / n
     if n > 2:
-        se = statistics.stdev(trades) / math.sqrt(n)
+        sd = statistics.stdev(trades)
+        se = sd / math.sqrt(n)
         ci = (mean - 1.96 * se, mean + 1.96 * se)
+        # t = media/erro-padrao: pondera o efeito pelo tamanho da amostra.
+        tstat = mean / se if se > 0 else None
+        # Efeito minimo detectavel a 80% de poder, alpha=0,05 bilateral.
+        mde = 2.8 * sd / math.sqrt(n)
     else:
-        ci = (None, None)
+        ci, tstat, mde, sd = (None, None), None, None, None
     return {"trades": n, "mean_bps": mean, "ci_lo": ci[0], "ci_hi": ci[1],
-            "total_bps": total, "win_rate": wins}
+            "total_bps": total, "win_rate": wins, "sd_bps": sd,
+            "tstat": tstat, "mde_bps": mde}
 
 
 # ── Grid ─────────────────────────────────────────────────────────────
@@ -275,13 +281,21 @@ def evaluate_all(closes, highs, lows, split, cost_bps, label, min_trades):
 
 
 def best_by_train(results, min_trades):
-    """Seleção SÓ pelo treino. Olhar a validação para escolher a invalida."""
+    """
+    Seleção SÓ pelo treino. Olhar a validação para escolher a invalida.
+
+    Critério: estatistica t (media/erro-padrao), NAO media por trade.
+    Selecionar pela media favorece agentes que operam pouco e com variancia
+    alta — exatamente os de menor poder estatistico, que depois nao
+    conseguem confirmar nada na validacao. O t pondera pelo tamanho da
+    amostra e escolhe o efeito mais bem estabelecido, nao o maior.
+    """
     eligible = [r for r in results
                 if r["train"]["trades"] >= min_trades
-                and r["train"]["mean_bps"] is not None]
+                and r["train"]["tstat"] is not None]
     if not eligible:
         return None
-    return max(eligible, key=lambda r: r["train"]["mean_bps"])
+    return max(eligible, key=lambda r: r["train"]["tstat"])
 
 
 def fmt(v, nd=2):
@@ -342,8 +356,29 @@ def main():
     print("  RESULTADO")
     print("=" * 78)
     print()
+    expected_fp = len(real) * 0.025   # IC 95% bilateral -> 2,5% por cauda
     print(f"  agentes testados            : {len(real)}")
     print(f"  sobreviventes (IC>0 na val) : {len(survivors)}")
+    print(f"  esperado por acaso          : ~{expected_fp:.0f} "
+          f"(multiplicidade de {len(real)} agentes)")
+    if len(survivors) <= expected_fp:
+        print("    -> igual ou ABAIXO do acaso: consistente com ausencia de sinal.")
+    else:
+        print("    -> acima do acaso, mas isso sozinho nao valida nenhum agente.")
+
+    # Poder do teste: o negativo so vale se o teste conseguiria ver um positivo.
+    mdes = [r["val"]["mde_bps"] for r in real
+            if r["val"]["mde_bps"] is not None and r["val"]["trades"] >= args.min_trades]
+    if mdes:
+        mdes.sort()
+        print()
+        print("  PODER DO TESTE (efeito minimo detectavel na validacao)")
+        print(f"    melhor agente da grade : {mdes[0]:.1f} bps/trade")
+        print(f"    mediana da grade       : {statistics.median(mdes):.1f} bps/trade")
+        print(f"    custo de rede          : {cost_med:.1f} bps")
+        print()
+        print("    Um 'sem sinal' so e conclusivo para efeitos ACIMA do MDE.")
+        print("    Abaixo disso o teste e cego, e o negativo nao significa ausencia.")
 
     if best_real:
         v, t = best_real["val"], best_real["train"]
@@ -353,9 +388,12 @@ def main():
               f"alvo={best_real['target_bps']} stop={best_real['stop_bps']} "
               f"hold={best_real['max_hold']}")
         print(f"    treino    : {t['trades']:>5} trades | "
-              f"{fmt(t['mean_bps'])} bps/trade | acerto {fmt((t['win_rate'] or 0)*100,1)}%")
+              f"{fmt(t['mean_bps'])} bps/trade | t={fmt(t['tstat'])} | "
+              f"acerto {fmt((t['win_rate'] or 0)*100,1)}%")
         print(f"    VALIDACAO : {v['trades']:>5} trades | "
               f"{fmt(v['mean_bps'])} bps/trade | IC95 [{fmt(v['ci_lo'])}, {fmt(v['ci_hi'])}]")
+        print(f"                MDE {fmt(v['mde_bps'],1)} bps — abaixo disso este "
+              f"agente nao distingue sinal de ruido")
 
     if best_ctrl:
         cv = best_ctrl["val"]
