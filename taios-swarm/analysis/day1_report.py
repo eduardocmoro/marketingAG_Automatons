@@ -172,6 +172,10 @@ CHEAPEST_POOL_ROUND_TRIP_PCT = 0.02
 # preco compete com o custo medido e a amostra nao serve.
 MAX_LEG_GAP_MS = 300
 
+# Fracao de amostras contaminadas que invalida o bloco. Uma amostra marginal
+# em 64 nao derruba a medicao — ela e excluida das tabelas e segue.
+MAX_CONTAMINATED_FRACTION = 0.05
+
 
 def ingest(jsonl_path: Path, db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -456,6 +460,9 @@ def build_cohort(conn):
         conn.execute(
             f"CREATE TEMP VIEW {view} AS SELECT * FROM {table} WHERE run_id IN "
             f"(SELECT run_id FROM run WHERE COALESCE(schema_version,0) = {latest})"
+            # Round trip com gap alto mede oscilacao, nao custo: fora das tabelas.
+            + (f" AND (leg_gap_ms IS NULL OR leg_gap_ms <= {MAX_LEG_GAP_MS})"
+               if table == "round_trip" else "")
         )
 
     total_rt = conn.execute("SELECT COUNT(*) FROM round_trip").fetchone()[0]
@@ -703,9 +710,28 @@ def integrity_section(conn):
     print()
     print(f"  TESTE 2 — PISO FISICO (perda >= {CHEAPEST_POOL_ROUND_TRIP_PCT}% no round trip)")
     print("  " + "-" * 68)
-    below = [(sz, l) for sz, l, _ in rows if l < CHEAPEST_POOL_ROUND_TRIP_PCT]
+    negative = [(sz, l) for sz, l, _ in rows if l <= 0]
+    below = [(sz, l) for sz, l, _ in rows if 0 < l < CHEAPEST_POOL_ROUND_TRIP_PCT]
     if not rows:
         print("    sem amostras")
+    elif negative:
+        verdicts["above_floor"] = False
+        print(f"    [FALHOU] {len(negative)}/{len(rows)} tamanhos com perda NEGATIVA —")
+        print("             o round trip cotado devolve MAIS do que entrou.")
+        for sz, l in negative[:8]:
+            print(f"      ${sz:g}: {l:+.4f}%")
+        print()
+        print("    Isto nao e venue barato: e impossivel como custo. Venues de spread")
+        print("    sao market makers cotando independentemente, e o roteador toma o")
+        print("    melhor ask numa perna e o melhor bid na outra, de MMs diferentes.")
+        print("    O agregado cruza, e o metodo cotacao-contra-cotacao deixa de medir")
+        print("    custo. Sem preco de referencia INDEPENDENTE (oracle) nao ha medicao.")
+        if len(negative) > 1:
+            trend = sorted(negative, key=lambda x: x[0])
+            if trend[0][1] < trend[-1][1]:
+                print()
+                print("    O efeito ENCOLHE com o tamanho — assinatura estrutural, nao")
+                print("    ruido: menos MMs cotam notional grande, menos cruzamento.")
     elif below:
         verdicts["above_floor"] = False
         print(f"    [ATENCAO] {len(below)}/{len(rows)} tamanhos abaixo de "
@@ -723,8 +749,9 @@ def integrity_section(conn):
     # amostras de versoes anteriores nao tem esse campo e um COALESCE(...,0)
     # as contava como limpas, produzindo contagem incoerente com a media.
     gaps = [r[0] for r in conn.execute(
-        "SELECT leg_gap_ms FROM round_trip_cohort "
-        "WHERE error IS NULL AND leg_gap_ms IS NOT NULL ORDER BY leg_gap_ms"
+        f"SELECT leg_gap_ms FROM round_trip WHERE error IS NULL "
+        f"AND leg_gap_ms IS NOT NULL AND run_id IN "
+        f"(SELECT run_id FROM run WHERE {RUN_IN_COHORT}) ORDER BY leg_gap_ms"
     )]
     print()
     print("  TESTE 0 — GAP ENTRE AS PERNAS DO ROUND TRIP")
@@ -738,11 +765,17 @@ def integrity_section(conn):
         print(f"    n={total} | p50 {pct(gaps,0.5):.0f}ms | p90 {pct(gaps,0.9):.0f}ms | "
               f"max {max_gap:.0f}ms | media {avg_gap:.0f}ms")
         print(f"    limite {MAX_LEG_GAP_MS}ms -> {contaminated} acima ({contaminated/total*100:.0f}%)")
-        if contaminated:
+        frac = contaminated / total
+        if frac > MAX_CONTAMINATED_FRACTION:
             verdicts["leg_gap"] = False
-            print(f"    [FALHOU] {contaminated}/{total} amostras acima do limite.")
-            print("             A deriva de preco entre as pernas compete com o custo")
-            print("             medido. Essas amostras medem oscilacao, nao custo.")
+            print(f"    [FALHOU] {contaminated}/{total} ({frac*100:.0f}%) acima do limite,")
+            print(f"             passando de {MAX_CONTAMINATED_FRACTION*100:.0f}%. A deriva")
+            print("             entre as pernas compete com o custo medido.")
+        elif contaminated:
+            verdicts["leg_gap"] = True
+            print(f"    [OK] {contaminated}/{total} ({frac*100:.0f}%) acima do limite —")
+            print("         abaixo do corte. Essas amostras foram EXCLUIDAS das tabelas")
+            print("         de custo; as demais seguem validas.")
         else:
             verdicts["leg_gap"] = True
             print(f"    [OK] {total} amostras dentro do limite.")
