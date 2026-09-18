@@ -12,6 +12,7 @@ secrets/
 data/*.jsonl
 data/*.sqlite
 data/market_summary.json
+data/grid_result.json
 
 # ── Derivados da análise (regeneráveis a partir do .jsonl) ───────────
 measurements/*.sqlite
