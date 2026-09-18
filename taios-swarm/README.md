@@ -83,6 +83,76 @@ Estatística não é reimplementada em TS.
 
 ---
 
+## RESULTADO DO DAY 1 — FECHADO
+
+Medido em 8 execuções (coorte v3, `cu_consumed` por `simulateTransaction` em
+100% das amostras, priority fee filtrada por `ammKey`). SOL a US$101,68.
+
+### Break-even por tamanho de posição
+
+| posição | break-even mediana | p90 |
+|---|---|---|
+| US$1 | **0,42%** | 1,17% |
+| US$5 | ~0,085% | ~0,23% |
+| US$50 | ~0,0085% | ~0,023% |
+
+O custo de rede é **fixo em dólar** (~US$0,0043 por round trip na mediana), então
+como % do notional ele explode quando a posição encolhe. Em US$1 ele responde por
+**~98%** do break-even.
+
+**Decisão: o tamanho operacional passa a ser US$5.** Em US$1 a taxa fixa consome
+tudo e o gargalo deixa de ser o mercado.
+
+### Componentes medidos
+
+| componente | valor | fonte |
+|---|---|---|
+| `cu_consumed` | 68.807 por perna | `simulateTransaction` (não estimativa) |
+| priority fee (pool) | p50 216.780 / p90 256.032 µlamp/CU | `getRecentPrioritizationFees` filtrado por `ammKey` |
+| base fee | 5.000 lamports/assinatura | constante de protocolo |
+| rent de ATA | 1.488.440 lamports = US$0,1514 | `getMinimumBalanceForRentExemption`, setup único |
+| gap entre pernas | p50 142ms, p90 252ms | dentro do limite de 300ms |
+
+A estimativa do roteador para `cu_consumed` era **145.299** — superestimava a real
+em **2,1x**. E a priority fee medida com filtro de mints (1.000) estava **200x
+abaixo** da real filtrada por `ammKey`. Os dois erros apontavam em direções
+opostas; o líquido é custo de rede ~4x maior que a primeira leitura.
+
+Um achado favorável: p90/p50 da fee = **1,18x**. Alta, mas **estável** — o custo é
+caro e previsível, não caro e errático.
+
+### O que NÃO foi medido: custo de spread
+
+A perda de round trip saiu **negativa** em 7 de 8 tamanhos (−0,0081% em US$0,50,
+encolhendo até +0,0027% em US$500). Ganho é impossível como custo.
+
+Causa, confirmada pelas rotas observadas: **a perna 1 e a perna 2 quase nunca
+passam pelo mesmo venue**. Em 8 execuções de US$0,50 houve 8 rotas distintas —
+compra do Byreal e vende para o Quantum, compra do Flux e vende para o Byreal. O
+roteador toma o melhor ask de um market maker e o melhor bid de outro, e o
+agregado **cruza**. O efeito encolhe com o tamanho porque menos MMs cotam notional
+grande e os dois lados se sobrepõem mais.
+
+Consequências:
+
+1. O método cotação-contra-cotação **não mede custo de spread** neste par.
+2. Nenhum dos 16 venues declara `feeAmount` — o TESTE 3 fica NÃO APLICÁVEL.
+3. Não existe rota estável, então agrupar tamanhos por rota (TESTE 1) não
+   significa nada aqui.
+
+**Isso não invalida o break-even acima**, porque o componente quebrado vale
+−0,008% contra 0,42% de rede. Mas bloqueia medir custo em tamanhos grandes, onde o
+spread passa a pesar, e bloqueia a Fase 2. Requer preço de referência
+**independente da Jupiter** (oracle on-chain). Ainda não implementado.
+
+### A pergunta que sobra
+
+Não é mais "qual o custo" — está medido. É: **existe horizonte em que o movimento
+previsível de SOL/USDC supera 0,085% em US$5?** Isso sai de histórico de preço, e
+é o que o Day 2–3 responde.
+
+---
+
 ## Day 1 — só medição de custo
 
 Zero código de estratégia. O que é medido:

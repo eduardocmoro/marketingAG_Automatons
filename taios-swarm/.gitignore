@@ -8,6 +8,11 @@ id.json
 !.env.example
 secrets/
 
+# ── Série de preço: grande e re-baixável, não entra no repo ──────────
+data/*.jsonl
+data/*.sqlite
+data/market_summary.json
+
 # ── Derivados da análise (regeneráveis a partir do .jsonl) ───────────
 measurements/*.sqlite
 measurements/*.sqlite-journal

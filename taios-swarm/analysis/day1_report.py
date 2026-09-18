@@ -160,8 +160,9 @@ SLIPPAGE_GRID_BPS = [5, 10, 25, 50, 100, 200, 300, 500]
 # reversão calculada não significa nada.
 MIN_DRIFT_SAMPLES = 30
 
-# Posição central da tese — a curva é desenhada em detalhe para ela.
-THESIS_POSITION_USDC = 1.0
+# Posição central da tese. Movida de 1.0 para 5.0 apos o Day 1: em US$1 a
+# taxa FIXA de rede consome 0,42% do notional e domina tudo o mais.
+THESIS_POSITION_USDC = 5.0
 
 # Piso físico de taxa: o tier CLMM mais barato que existe em pool relevante
 # é 0,01% por swap = 0,02% no round trip. Perda medida abaixo disso significa
