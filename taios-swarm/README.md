@@ -218,6 +218,66 @@ somado ao Day 3 torna isso quantitativo.
 
 ---
 
+## RESULTADO DO DAY 5 — ARBITRAGEM CEX↔DEX NÃO FECHA
+
+109 amostras válidas (11 excluídas por intervalo entre venues acima de 400ms),
+quatro tamanhos, ambas as direções, livro de ofertas da Binance caminhado para o
+mesmo notional da cotação Jupiter.
+
+### A diferença não chega perto do custo
+
+| | valor |
+|---|---|
+| diferença bruta, mediana | **−0,3 bps** |
+| diferença bruta, p90 | +1,0 bps |
+| **maior diferença observada** | **+2,8 bps** |
+| custo de captura em US$50 | **10,71 bps** |
+
+Errado por **4x**, não por pouco. E a taxa taker da Binance sozinha (10 bps) é uma
+ordem de magnitude maior que o spread residual: mesmo com Jupiter e rede de graça,
+não fecharia.
+
+**SOL/USDC está arbitrado até a casa de ~1 bps.**
+
+### O mistério do Day 1 está resolvido
+
+O spread interno de cada venue, medido no mesmo instante:
+
+```
+$5   : Jupiter −0,7 bps | Binance +0,9 bps
+$25  : Jupiter −0,2 bps | Binance +0,9 bps
+$50  : Jupiter −0,1 bps | Binance +0,9 bps
+$250 : Jupiter  0,0 bps | Binance +0,9 bps
+```
+
+O spread negativo da Jupiter em notional pequeno é **real**, não artefato de
+medição — encolhe com o tamanho exatamente como no Day 1, e a Binance dá a
+referência de como um venue normal se comporta (+0,9 bps, estável).
+
+Os market makers que a Jupiter agrega **de fato cruzam cotação** em notional
+pequeno: o melhor ask de um fica abaixo do melhor bid de outro.
+
+**Mas é economicamente irrelevante:** 0,7 bps contra 8,08 bps de taxa de rede em
+US$5. Capturar o cruzamento inteiro ainda perderia 7,4 bps.
+
+Isso corrige um registro anterior: o validador por oracle independente foi
+descrito como **bloqueio** para fechar a Fase 2. Não era — o livro da Binance
+serviu de referência independente e respondeu a mesma pergunta, mais barato.
+
+### Nota sobre onde está o custo
+
+Desde o Day 1 a taxa de rede vinha sendo tratada como custo principal. Em
+arbitragem com CEX **ela não é**:
+
+```
+US$50:  Binance taker 10,0 bps (92%)  |  rede Solana 0,85 bps (8%)
+```
+
+E a taxa da Binance é **percentual** — não melhora aumentando a posição, ao
+contrário da rede.
+
+---
+
 ## Day 1 — só medição de custo
 
 Zero código de estratégia. O que é medido:
