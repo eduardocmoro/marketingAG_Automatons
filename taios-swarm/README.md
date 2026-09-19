@@ -153,6 +153,71 @@ previsível de SOL/USDC supera 0,085% em US$5?** Isso sai de histórico de preç
 
 ---
 
+## RESULTADO DO DAY 3 — SEM SINAL DETECTÁVEL
+
+Grid de 324 agentes (momentum e reversão × 3 janelas × 3 limiares × 3 alvos ×
+3 stops × 2 holds) sobre 129.601 candles de 1 min de SOL/USDC, 90 dias, zero
+lacunas. Posição de US$5, custo de rede de 8,08 bps por round trip.
+
+### Teste de permutação — 50 embaralhamentos
+
+```
+distribuição nula: p05 −12,25 | mediana −0,35 | p95 +19,78 | max +35,74 bps/trade
+observado (real) : +4,88 bps/trade
+p-valor          : 0,314  (15 de 50 embaralhamentos igualaram ou superaram)
+```
+
+**Veredito: o resultado real é indistinguível do que o mesmo procedimento produz
+sobre dado sem estrutura temporal.**
+
+Três evidências independentes apontam na mesma direção:
+
+1. **p = 0,314.** Longe de qualquer limiar de decisão.
+2. **Melhor t do treino = 0,89.** Com 324 agentes selecionados *in-sample*, onde o
+   sobreajuste deveria inflar o resultado, nenhum agente chega perto de
+   significância.
+3. **1 sobrevivente contra ~8 esperados por acaso.** Com IC de 95% e 324 agentes,
+   a multiplicidade sozinha produziria mais falsos positivos do que apareceram.
+
+### Por que o controle único não servia
+
+Entre duas execuções sobre a **mesma série e a mesma grade**, mudando apenas o
+critério de seleção, o melhor agente do controle foi de **+12,53** para **−13,71**
+bps/trade. Um único controle é um sorteio de uma distribuição que vai de −12 a
++36 — comparar contra ele decide pelo sorteio, não pelo sinal. Daí o teste de
+permutação.
+
+### O limite do que este negativo estabelece
+
+Vale para: momentum e reversão simples, SOL/USDC, candles de 1 min, 90 dias,
+long-only, com os custos medidos.
+
+**Não** estabelece que nenhuma estratégia existe. E o teste é forte para efeitos
+grandes e fraco para pequenos: a nula tem largura de ~±20 bps, então um edge real
+de 3–5 bps/trade seria invisível aqui.
+
+Só que essa faixa invisível também é **antieconômica** — ver a aritmética abaixo.
+
+### A aritmética de throughput
+
+Com **uma posição por vez** e hold típico de 60 min, o teto é ~24 trades/dia.
+Para a meta original de US$5/dia:
+
+| posição | net bps/trade necessários | leitura |
+|---|---|---|
+| US$5 | **417 bps** (4,2% por trade) | inviável |
+| US$50 | 42 bps | muito difícil |
+| US$500 | 4,2 bps | plausível, mas exige capital |
+
+Com N posições simultâneas o requisito cai por N — 20 agentes a US$5 precisariam
+de 21 bps/trade. Mas paralelismo só multiplica edge que exista, e não foi
+encontrado.
+
+**A meta financeira e o tamanho de posição estão em tensão direta**, e o Day 1
+somado ao Day 3 torna isso quantitativo.
+
+---
+
 ## Day 1 — só medição de custo
 
 Zero código de estratégia. O que é medido:
