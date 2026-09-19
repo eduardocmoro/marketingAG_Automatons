@@ -148,6 +148,11 @@ async function main() {
       closeTimeMs: k[6],
       quoteVolume: Number(k[7]),
       trades: k[8],
+      // FLUXO DE ORDENS: volume do lado que ATACOU o book (taker).
+      // takerBuy/volume da a pressao compradora agressora naquele minuto.
+      // E um sinal de natureza diferente de preco — quem estava com pressa.
+      takerBuyBase: Number(k[9]),
+      takerBuyQuote: Number(k[10]),
       source: "binance",
     }));
 

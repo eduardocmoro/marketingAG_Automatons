@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS candle (
     quote_volume  REAL,
     trades        INTEGER,
     close_time_ms INTEGER,
+    taker_buy_base  REAL,   -- volume comprador agressor (fluxo de ordens)
+    taker_buy_quote REAL,
     source        TEXT,
     PRIMARY KEY (symbol, interval, open_time_ms)
 );
@@ -59,6 +61,11 @@ def ingest(jsonl: Path, db: Path) -> sqlite3.Connection:
     db.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db)
     conn.executescript(SCHEMA)
+    for col, decl in [("taker_buy_base", "REAL"), ("taker_buy_quote", "REAL")]:
+        try:
+            conn.execute(f"ALTER TABLE candle ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass  # coluna já existe
 
     if not jsonl.exists():
         print(f"ERRO: {jsonl} não existe. Rode scripts/fetch-history.mjs primeiro.")
@@ -78,13 +85,15 @@ def ingest(jsonl: Path, db: Path) -> sqlite3.Connection:
             cur = conn.execute(
                 """INSERT OR IGNORE INTO candle
                    (symbol, interval, open_time_ms, open, high, low, close,
-                    volume, quote_volume, trades, close_time_ms, source)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    volume, quote_volume, trades, close_time_ms,
+                    taker_buy_base, taker_buy_quote, source)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     c.get("symbol"), c.get("interval"), c.get("openTimeMs"),
                     c.get("open"), c.get("high"), c.get("low"), c.get("close"),
                     c.get("volume"), c.get("quoteVolume"), c.get("trades"),
-                    c.get("closeTimeMs"), c.get("source"),
+                    c.get("closeTimeMs"), c.get("takerBuyBase"),
+                    c.get("takerBuyQuote"), c.get("source"),
                 ),
             )
             if cur.rowcount:
