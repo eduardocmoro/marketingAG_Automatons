@@ -326,6 +326,40 @@ def main():
               f"{t['spread_bps']:>10.2f} {t['t']:>7.2f} | "
               f"{v['spread_bps']:>10.2f} {v['t']:>7.2f} | {v['n']:>5}{mark}")
 
+    # ── Poder POR HORIZONTE ──
+    # O n cai com o passo nao-sobreposto: horizonte 5 tem ~13 mil amostras,
+    # horizonte 240 tem ~270. Um "sem sinal" forte em 5 min e um "sem sinal"
+    # cego em 240 min, e sem isto os dois parecem iguais.
+    print()
+    print("  PODER POR HORIZONTE (o que o teste consegue enxergar)")
+    print("  " + "-" * 74)
+    print(f"  {'H':>5} {'n':>7} | {'SE tipico':>10} | {'MDE spread':>11} | "
+          f"{'MDE por perna':>14} | leitura")
+    print("  " + "-" * 74)
+    power = {}
+    for h in horizons:
+        ses = [r["val"]["se"] for r in results
+               if r["horizon"] == h and r["val"]["se"]]
+        ns = [r["val"]["n"] for r in results if r["horizon"] == h]
+        if not ses:
+            continue
+        se = statistics.median(ses)
+        mde = 2.8 * se          # 80% de poder, alpha 0,05
+        per_leg = mde / 2
+        if c5:
+            # Em que tamanho de posicao o MDE por perna cobriria o custo
+            size_needed = c5 * args.position / per_leg if per_leg > 0 else None
+            leitura = (f"detecta o que lucra a partir de US${size_needed:.0f}"
+                       if size_needed and size_needed < 10_000 else "cego para o util")
+        else:
+            leitura = ""
+        print(f"  {h:>5} {statistics.median(ns):>7.0f} | {se:>10.2f} | "
+              f"{mde:>11.2f} | {per_leg:>14.2f} | {leitura}")
+        power[h] = {"n": statistics.median(ns), "se": se, "mde_bps": mde}
+    print()
+    print("    MDE = menor spread que o teste distingue de zero com 80% de poder.")
+    print("    Abaixo disso o negativo nao significa ausencia — significa cegueira.")
+
     # ── Confirmados ──
     confirmed = [r for r in results
                  if (r["train"]["spread_bps"] > 0) == (r["val"]["spread_bps"] > 0)
@@ -384,6 +418,7 @@ def main():
     out.write_text(json.dumps({
         "symbol": args.symbol, "interval": args.interval,
         "tests": n_tests, "confirmed": len(confirmed),
+        "power_by_horizon": power,
         "results": results[:50],
     }, indent=2), "utf-8")
     print(f"\n  Detalhe: {out}")
