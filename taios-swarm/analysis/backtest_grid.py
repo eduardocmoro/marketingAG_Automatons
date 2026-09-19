@@ -309,6 +309,8 @@ def main():
     ap.add_argument("--interval", default="1m")
     ap.add_argument("--position", type=float, default=5.0)
     ap.add_argument("--min-trades", type=int, default=30)
+    ap.add_argument("--permutations", type=int, default=50,
+                    help="embaralhamentos para a distribuicao nula (0 desliga)")
     ap.add_argument("--day1", type=Path, default=None,
                     help="caminho do day1_summary.json (padrão: measurements/)")
     args = ap.parse_args()
@@ -335,11 +337,24 @@ def main():
     print("  [1/2] Serie real...")
     real = evaluate_all(closes, highs, lows, split, cost_med, "real", args.min_trades)
 
-    print("  [2/2] Controle (retornos embaralhados)...")
+    print(f"  [2/2] Controle: {args.permutations} embaralhamentos...")
+    # Um unico controle e um sorteio de uma distribuicao larga: trocar o
+    # criterio de selecao fez a estimativa do piso de ruido variar 26 bps.
+    # O teste de permutacao roda o PROCEDIMENTO INTEIRO (selecionar no treino
+    # pelo t, avaliar na validacao) sobre muitos embaralhamentos e compara o
+    # real contra a distribuicao nula, em vez de contra um unico sorteio.
     rng = random.Random(SEED)
-    c_closes, c_highs, c_lows = shuffled_series(closes, rng)
-    ctrl = evaluate_all(c_closes, c_highs, c_lows, split, cost_med, "controle",
-                        args.min_trades)
+    null_stats = []
+    ctrl = None
+    for k in range(max(1, args.permutations)):
+        c_closes, c_highs, c_lows = shuffled_series(closes, rng)
+        c = evaluate_all(c_closes, c_highs, c_lows, split, cost_med,
+                         f"perm {k+1}/{args.permutations}", args.min_trades)
+        bc = best_by_train(c, args.min_trades)
+        if bc and bc["val"]["mean_bps"] is not None:
+            null_stats.append(bc["val"]["mean_bps"])
+        if ctrl is None:
+            ctrl = c   # guarda o primeiro para exibicao detalhada
 
     best_real = best_by_train(real, args.min_trades)
     best_ctrl = best_by_train(ctrl, args.min_trades)
@@ -403,9 +418,47 @@ def main():
         print(f"    VALIDACAO : {cv['trades']:>5} trades | "
               f"{fmt(cv['mean_bps'])} bps/trade | IC95 [{fmt(cv['ci_lo'])}, {fmt(cv['ci_hi'])}]")
 
+    # ── Teste de permutacao: onde o real cai na distribuicao nula ──
+    pval = None
+    if null_stats and best_real and best_real["val"]["mean_bps"] is not None:
+        obs = best_real["val"]["mean_bps"]
+        ge = sum(1 for x in null_stats if x >= obs)
+        pval = (ge + 1) / (len(null_stats) + 1)   # estimador conservador
+        ns = sorted(null_stats)
+        print()
+        print(f"  DISTRIBUICAO NULA ({len(null_stats)} embaralhamentos)")
+        print("  " + "-" * 68)
+        print(f"    p05 {ns[int(len(ns)*0.05)]:>7.2f} | mediana {statistics.median(ns):>7.2f} | "
+              f"p95 {ns[int(len(ns)*0.95)]:>7.2f} | max {ns[-1]:>7.2f}  bps/trade")
+        print(f"    observado (real)  : {obs:>7.2f} bps/trade")
+        print(f"    p-valor           : {pval:.3f}  "
+              f"({ge} de {len(null_stats)} embaralhamentos igualaram ou superaram)")
+        print()
+        print("    Isto substitui a comparacao contra UM controle: o piso de ruido")
+        print("    e uma distribuicao, nao um numero.")
+
     print()
     print("  " + "=" * 74)
-    if not best_real or not best_ctrl:
+    if pval is not None:
+        obs = best_real["val"]["mean_bps"]
+        if pval > 0.10:
+            print(f"  VEREDITO: p={pval:.3f}. O resultado real e indistinguivel do que")
+            print("  o mesmo procedimento produz sobre dado SEM estrutura temporal.")
+            print("  Nao ha sinal detectavel nesta grade.")
+        elif pval > 0.05:
+            print(f"  VEREDITO: p={pval:.3f}. Marginal. Nao passa em 5% e nao sustenta")
+            print("  decisao. Precisa de mais dado, nao de mais grade.")
+        else:
+            print(f"  VEREDITO: p={pval:.3f}. O real supera a distribuicao nula.")
+            print("  Primeiro indicio estatistico de sinal. AINDA NAO e aprovacao:")
+            print("  falta classificar por regime (>= 2 distintos) e somar o custo")
+            print("  de spread, que nao foi medido e piora tudo acima.")
+        if best_real["val"]["mde_bps"] and obs < best_real["val"]["mde_bps"]:
+            print()
+            print(f"  RESSALVA: o efeito observado ({obs:.2f} bps) esta ABAIXO do MDE")
+            print(f"  deste agente ({best_real['val']['mde_bps']:.1f} bps). Mesmo com p")
+            print("  favoravel, a amostra nao sustenta o tamanho do efeito.")
+    elif not best_real or not best_ctrl:
         print("  VEREDITO: sem agentes elegiveis. Baixe --min-trades ou amplie a grade.")
     else:
         rv = best_real["val"]["mean_bps"]
@@ -436,6 +489,8 @@ def main():
         "candles": len(closes), "split": split,
         "agents_tested": len(real), "survivors": len(survivors),
         "best_real": best_real, "best_control": best_ctrl,
+        "permutations": len(null_stats), "null_distribution": sorted(null_stats),
+        "p_value": pval,
     }, indent=2), "utf-8")
     print(f"\n  Detalhe em JSON: {out}")
 
